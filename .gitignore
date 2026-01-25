@@ -1,0 +1,56 @@
+# Byte-compiled / cache / virtual env
+.venvBatchSubmit/
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+env/
+venv/
+.venv/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Logs
+logs/
+*.log
+
+# Unit test / coverage reports
+.coverage
+.tox/
+.nox/
+coverage.xml
+htmlcov/
+
+# Secret/config files
+.env
+*.env
+*.key
+*.pem
+*.crt
+# *.json # Commented out to allow potential config files, but check if you have secrets in json
+# config.yaml
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Scripts and specs
+# *.sh
+# *.bat
+# *.spec
+
+# Docs/static
+docs/
+

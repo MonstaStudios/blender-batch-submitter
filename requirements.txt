@@ -1,0 +1,16 @@
+# Python 3.12 Compatible Dependencies
+
+# Desktop App (PyWebView)
+pywebview==5.0.5
+typing-extensions==4.12.2
+
+# Windows-specific backend
+pywin32==306; sys_platform == 'win32'
+
+# Build tool (only needed for creating .exe)
+pyinstaller==6.11.1
+
+# Optional: Flask backend alternative (uncomment if using Flask mode)
+Flask==3.0.3
+flask-cors==5.0.0
+
