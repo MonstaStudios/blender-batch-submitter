@@ -6,7 +6,6 @@ on:
       - main
       - master
       - develop
-      # Add other branches you want to monitor
   
   issues:
     types: [opened, closed]
@@ -19,7 +18,7 @@ jobs:
       - name: Send Push Notification to Google Chat
         run: |
           COMMITS=$(echo '${{ toJson(github.event.commits) }}' | jq -r '.[0:5] | map("• " + .message) | join("\n")')
-          COMMIT_COUNT=$(echo '${{ toJson(github.event.commits) }}' | jq 'length')
+          COMMIT_COUNT=$(echo '${{ toJson(github.event.commits) }}' | jq '. | length')
           
           if [ $COMMIT_COUNT -gt 5 ]; then
             COMMITS="${COMMITS}\n... and $((COMMIT_COUNT - 5)) more commits"
