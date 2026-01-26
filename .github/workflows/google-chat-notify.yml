@@ -1,0 +1,70 @@
+name: Google Chat Notifications
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - develop
+  
+  issues:
+    types: [opened, closed]
+
+jobs:
+  notify-push:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Push Notification to Google Chat
+        run: |
+          COMMITS=$(echo '${{ toJson(github.event.commits) }}' | jq -r '.[0:5] | map("• " + .message) | join("\n")')
+          COMMIT_COUNT=$(echo '${{ toJson(github.event.commits) }}' | jq '. | length')
+          
+          if [ $COMMIT_COUNT -gt 5 ]; then
+            COMMITS="${COMMITS}\n... and $((COMMIT_COUNT - 5)) more commits"
+          fi
+          
+          MESSAGE=$(cat <<EOF
+          {
+            "text": "🚀 *New Push to ${{ github.repository }}*\n\nBranch: \`${{ github.ref_name }}\`\nPushed by: ${{ github.actor }}\nCommits: ${COMMIT_COUNT}\n\n${COMMITS}\n\n<${{ github.event.compare }}|View changes>"
+          }
+          EOF
+          )
+          
+          curl -X POST "${{ secrets.GOOGLE_CHAT_WEBHOOK }}" \
+            -H 'Content-Type: application/json' \
+            -d "$MESSAGE"
+
+  notify-issue-opened:
+    if: github.event_name == 'issues' && github.event.action == 'opened'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Issue Opened Notification to Google Chat
+        run: |
+          MESSAGE=$(cat <<EOF
+          {
+            "text": "🆕 *New Issue Opened in ${{ github.repository }}*\n\nIssue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}\nOpened by: ${{ github.event.issue.user.login }}\n\n<${{ github.event.issue.html_url }}|View issue>"
+          }
+          EOF
+          )
+          
+          curl -X POST "${{ secrets.GOOGLE_CHAT_WEBHOOK }}" \
+            -H 'Content-Type: application/json' \
+            -d "$MESSAGE"
+
+  notify-issue-closed:
+    if: github.event_name == 'issues' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Issue Closed Notification to Google Chat
+        run: |
+          MESSAGE=$(cat <<EOF
+          {
+            "text": "✅ *Issue Closed in ${{ github.repository }}*\n\nIssue #${{ github.event.issue.number }}: ${{ github.event.issue.title }}\nClosed by: ${{ github.event.sender.login }}\n\n<${{ github.event.issue.html_url }}|View issue>"
+          }
+          EOF
+          )
+          
+          curl -X POST "${{ secrets.GOOGLE_CHAT_WEBHOOK }}" \
+            -H 'Content-Type: application/json' \
+            -d "$MESSAGE"
