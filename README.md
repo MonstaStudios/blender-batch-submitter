@@ -2,6 +2,22 @@
 
 A desktop application designed to streamline the process of batch submitting Blender render jobs to the CGRU/Afanasy render farm manager.
 
+# Checklist
+
+## Refactoring Checklist
+- [ ] Refactor front-end code for maintainability and clear job submission logic.
+- [ ] Remove or archive any deprecated or legacy interface code.
+- [ ] Consolidate duplicate components and ensure documentation is current.
+
+**Summary:** Clean, well-structured code will speed up the addition of new features and fix bugs faster.
+
+## Feature Update Checklist
+- [ ] Add UI/UX improvements for batch monitoring and progress.
+- [ ] Provide support for newer Blender features and render settings.
+- [ ] Integrate notification system for submission status.
+
+**Summary:** Make submission process seamless, informative, and compatible as the pipeline and Blender itself grow.
+
 ## Overview
 
 The CGRU Batch Submitter provides a user-friendly interface to scan directories for Blender files and submit them to a render farm. It handles the complexity of invoking Blender's Python API for submission, allowing users to use default or custom submission scripts.
