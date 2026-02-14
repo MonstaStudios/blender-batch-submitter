@@ -111,12 +111,11 @@ def resolve_output_path(path_str: str, blend_dir: Path) -> str:
     return path_str
 
 
-def get_view_layers(scene_block) -> List[Dict[str, Any]]:
-    """Extract all view layers from a scene block with their enabled status.
-
+def get_view_layers(scene_block) -> List[str]:
+    """Extract all view layers from a scene block.
+    
     View layers are stored as a linked list in scene.view_layers.
     Walk the list using iterators.listbase().
-    Returns list of dicts: [{"name": "ViewLayer", "use": True}, ...]
     """
     layers = []
     seen = set()  # Track seen names to avoid duplicates
@@ -131,27 +130,12 @@ def get_view_layers(scene_block) -> List[Dict[str, Any]]:
                 if isinstance(name_raw, bytes):
                     layer_name = name_raw.decode('utf-8', errors='ignore').rstrip('\x00')
                     if layer_name and layer_name not in seen:
-                        # Check if layer is enabled for rendering
-                        # ViewLayer.flag has VIEWLAYER_RENDER flag (bit 0x001)
-                        # Alternative: ViewLayer.use field (int32)
-                        use_enabled = True  # Default to enabled
-                        try:
-                            # ViewLayer has 'flag' field (short) where bit 0 is render enabled
-                            flag = layer.get(b'flag', 1)
-                            if isinstance(flag, int):
-                                use_enabled = bool(flag & 0x001)
-                        except:
-                            pass
-
-                        layers.append({
-                            "name": layer_name,
-                            "use": use_enabled
-                        })
+                        layers.append(layer_name)
                         seen.add(layer_name)
     except Exception:
         # Silently fail - some files may not have view layers
         pass
-
+    
     return layers
 
 

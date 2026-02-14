@@ -1,17 +1,3 @@
-def remove_job_id_txt(filepath: str, job_id: str):
-    """Remove the job_id txt file for a given blend file and job_id."""
-    import os
-    blend_dir = os.path.dirname(filepath)
-    job_id_dir = os.path.join(blend_dir, "job_id")
-    job_name = os.path.basename(filepath).replace(".blend", "")
-    txt_filename = f"{job_name}_jobID_{job_id}.txt"
-    txt_path = os.path.join(job_id_dir, txt_filename)
-    if os.path.exists(txt_path):
-        try:
-            os.remove(txt_path)
-        except Exception:
-            pass
-
 """
 Batch Submitter - Blender to CGRU Afanasy Farm
 A standalone PyQt6 desktop application for submitting Blender render jobs
@@ -70,7 +56,7 @@ from PyQt6.QtWidgets import (
     QMessageBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
-from PyQt6.QtGui import QFont, QColor, QPalette, QShortcut, QKeySequence
+from PyQt6.QtGui import QFont, QColor, QPalette
 
 import af
 
@@ -101,11 +87,6 @@ class BlendFileData:
     output_path: str = ""
     output_format: str = "OPEN_EXR"
     use_nodes: bool = False  # Compositing enabled
-    blender_version: str = ""  # Blender version from file header
-    # Track which fields have been manually overridden by user
-    user_overrides: set = field(default_factory=set)  # Set of field names
-    # Render layer submission mode
-    render_layers_parallel: bool = False  # True = multi-block, False = single-block (default)
 
 
 # ---------------------------------------------------------------------------
@@ -195,16 +176,6 @@ class SubmitThread(QThread):
                     job_id = ""
                     if isinstance(result[1], dict) and "id" in result[1]:
                         job_id = result[1]["id"]
-                        # Write job_id txt file
-                        import os
-                        blend_dir = os.path.dirname(filepath)
-                        job_id_dir = os.path.join(blend_dir, "job_id")
-                        os.makedirs(job_id_dir, exist_ok=True)
-                        job_name = os.path.basename(filepath).replace(".blend", "")
-                        txt_filename = f"{job_name}_jobID_{job_id}.txt"
-                        txt_path = os.path.join(job_id_dir, txt_filename)
-                        with open(txt_path, "w") as f:
-                            f.write(f"Job Name: {job_name}\nJob ID: {job_id}\nBlend File: {filepath}\n")
                     self.job_submitted.emit(filepath, True, f"Submitted (ID: {job_id})")
                 else:
                     self.job_submitted.emit(filepath, False, "Server rejected job")
@@ -217,193 +188,9 @@ class SubmitThread(QThread):
 # Submission engine
 # ---------------------------------------------------------------------------
 
-def _create_block_for_layer(
-    blend_file: str,
-    scene_name: str,
-    layer_name: str,
-    frame_start: int,
-    frame_end: int,
-    frames_per_task: int,
-    frame_step: int,
-    output_path: str,
-    output_format: str,
-    blender: str
-) -> af.Block:
-    """Create a single block for one view layer (multi-block mode).
-
-    Relies on blend file's view layer states (vl.use flags).
-    Blender automatically renders all enabled layers.
-    """
-    cmd = f'{blender} -b "{blend_file}" -y'
-    if scene_name:
-        cmd += f' -S "{scene_name}"'
-
-    # Python expression removed - rely on blend file layer states
-    # Blender renders all layers with vl.use=True automatically
-
-    if output_path:
-        cmd += f' -o "{output_path}"'
-    if output_format:
-        cmd += f' -F {output_format}'
-
-    # Use animation rendering for proper frame iteration with Afanasy
-    cmd += f' -s @#@ -e @#@ -j {frame_step} -a'
-
-    block_name = scene_name or "render"
-    if layer_name:
-        block_name = f"{block_name}_{layer_name}"
-
-    block = af.Block(block_name, 'blender')
-    block.setCommand(cmd, prefix=False)
-    block.setNumeric(frame_start, frame_end, frames_per_task, frame_step)
-    block.setWorkingDirectory(os.path.dirname(blend_file))
-
-    return block
-
-
-def _create_single_block_for_layers(
-    blend_file: str,
-    scene_name: str,
-    layer_names: list,
-    frame_start: int,
-    frame_end: int,
-    frames_per_task: int,
-    frame_step: int,
-    output_path: str,
-    output_format: str,
-    blender: str
-) -> af.Block:
-    """Create a single block for all selected layers (single-block mode).
-
-    Relies on blend file's view layer states (vl.use flags).
-    Blender automatically renders all enabled layers and outputs each to its own path.
-    """
-    cmd = f'{blender} -b "{blend_file}" -y'
-    if scene_name:
-        cmd += f' -S "{scene_name}"'
-
-    # Python expression removed - rely on blend file layer states
-    # Blender renders all layers with vl.use=True automatically
-    # User controls layer states by editing the blend file before submission
-
-    if output_path:
-        cmd += f' -o "{output_path}"'
-    if output_format:
-        cmd += f' -F {output_format}'
-
-    # Use animation rendering for proper frame iteration with Afanasy
-    cmd += f' -s @#@ -e @#@ -j {frame_step} -a'
-
-    # Block naming
-    if len(layer_names) == 1:
-        block_name = f"{scene_name}_{layer_names[0]}" if scene_name else layer_names[0]
-    else:
-        block_name = f"{scene_name}_AllLayers" if scene_name else "AllLayers"
-
-    block = af.Block(block_name, 'blender')
-    block.setCommand(cmd, prefix=False)
-    # Use normal frames_per_task (workaround no longer needed with animation rendering)
-    block.setNumeric(frame_start, frame_end, frames_per_task, frame_step)
-    block.setWorkingDirectory(os.path.dirname(blend_file))
-
-    return block
-
-
-def _submit_single_scene_mode(job: af.Job, blend_file: str, file_data: BlendFileData, blender: str, parallel_mode: bool):
-    """Submit a single scene with selected layers."""
-    scene_name = file_data.selected_scene
-    layers = file_data.selected_layers if file_data.selected_layers else [""]
-
-    # Filter out non-string entries if any (shouldn't happen but be safe)
-    layer_names = []
-    for layer_item in layers:
-        if isinstance(layer_item, str):
-            name = layer_item.strip()
-            if name:
-                layer_names.append(name)
-
-    if not layer_names:
-        layer_names = [""]  # Render active layer
-
-    if parallel_mode:
-        # Multi-block: Create one block per layer
-        for layer_name in layer_names:
-            block = _create_block_for_layer(
-                blend_file, scene_name, layer_name,
-                file_data.frame_start, file_data.frame_end,
-                file_data.frames_per_task, file_data.frame_step,
-                file_data.output_path, file_data.output_format, blender
-            )
-            job.blocks.append(block)
-    else:
-        # Single-block: All layers in one block
-        block = _create_single_block_for_layers(
-            blend_file, scene_name, layer_names,
-            file_data.frame_start, file_data.frame_end,
-            file_data.frames_per_task, file_data.frame_step,
-            file_data.output_path, file_data.output_format, blender
-        )
-        job.blocks.append(block)
-
-
-def _submit_all_scenes_mode(job: af.Job, blend_file: str, file_data: BlendFileData, blender: str, parallel_mode: bool):
-    """Submit all scenes with their individual settings."""
-    for scene in file_data.scenes:
-        scene_name = scene.get("name", "")
-        scene_layers = scene.get("view_layers", [])
-
-        # Extract enabled layer names
-        layer_names = []
-        for layer_data in scene_layers:
-            if isinstance(layer_data, dict):
-                layer_name = layer_data.get("name", "").strip()
-                layer_enabled = layer_data.get("use", True)
-                # Skip disabled layers to prevent black frame renders
-                if layer_enabled and layer_name:
-                    layer_names.append(layer_name)
-            elif isinstance(layer_data, str):
-                layer_name = layer_data.strip()
-                if layer_name:
-                    layer_names.append(layer_name)
-
-        if not layer_names:
-            layer_names = [""]  # Render active layer
-
-        # Use scene-specific settings
-        scene_output = scene.get("output_path", "")
-        scene_format = scene.get("output_format", "")
-        scene_start = scene.get("frame_start", 1)
-        scene_end = scene.get("frame_end", 250)
-        scene_step = scene.get("frame_step", 1)
-
-        if parallel_mode:
-            # Multi-block: One block per scene+layer combination
-            for layer_name in layer_names:
-                block = _create_block_for_layer(
-                    blend_file, scene_name, layer_name,
-                    scene_start, scene_end,
-                    file_data.frames_per_task, scene_step,
-                    scene_output, scene_format, blender
-                )
-                job.blocks.append(block)
-        else:
-            # Single-block: One block per scene (all layers together)
-            block = _create_single_block_for_layers(
-                blend_file, scene_name, layer_names,
-                scene_start, scene_end,
-                file_data.frames_per_task, scene_step,
-                scene_output, scene_format, blender
-            )
-            job.blocks.append(block)
-
-
 def submit_blend_job(blend_file: str, file_data: BlendFileData, settings: dict):
     """Submit a single .blend file as an Afanasy job.
-
-    Supports two submission modes:
-    - Multi-block (parallel): Each view layer renders as a separate block
-    - Single-block (sequential): All layers render in one block together
-
+    
     If file_data.selected_scene is '⚡ All Scenes', creates blocks for all scenes.
     Otherwise creates blocks for the selected scene only.
     """
@@ -424,13 +211,87 @@ def submit_blend_job(blend_file: str, file_data: BlendFileData, settings: dict):
         job.setDependMask(settings["depend_mask"])
 
     blender = settings.get("blender_path", "blender")
+    
+    # Check if rendering all scenes
     render_all_scenes = (file_data.selected_scene == "⚡ All Scenes")
-    parallel_mode = file_data.render_layers_parallel
-
+    
     if render_all_scenes:
-        _submit_all_scenes_mode(job, blend_file, file_data, blender, parallel_mode)
+        # Render all scenes with their individual settings
+        for scene in file_data.scenes:
+            scene_name = scene.get("name", "")
+            scene_layers = scene.get("view_layers", [])
+            if not scene_layers:
+                scene_layers = [""]
+            
+            for layer_name in scene_layers:
+                cmd = f'{blender} -b "{blend_file}"'
+                if scene_name:
+                    cmd += f' -S "{scene_name}"'
+                if layer_name:
+                    cmd += f' -L "{layer_name}"'
+                
+                # Use scene-specific settings
+                scene_output = scene.get("output_path", "")
+                if scene_output:
+                    cmd += f' -o "{scene_output}"'
+                
+                scene_format = scene.get("output_format", "")
+                if scene_format:
+                    cmd += f' -F {scene_format}'
+                
+                # Compositing flag
+                if scene.get("use_nodes", False):
+                    cmd += ' --use-nodes'
+                
+                cmd += ' -f @#@'
+                
+                block_name = scene_name or "render"
+                if layer_name:
+                    block_name = f"{block_name}_{layer_name}"
+                
+                block = af.Block(block_name, 'blender')
+                block.setCommand(cmd, prefix=False)
+                block.setNumeric(
+                    scene.get("frame_start", 1),
+                    scene.get("frame_end", 250),
+                    file_data.frames_per_task,
+                    scene.get("frame_step", 1),
+                )
+                block.setWorkingDirectory(os.path.dirname(blend_file))
+                job.blocks.append(block)
     else:
-        _submit_single_scene_mode(job, blend_file, file_data, blender, parallel_mode)
+        # Single scene mode (original behavior)
+        scene_name = file_data.selected_scene
+        layers = file_data.selected_layers if file_data.selected_layers else [""]
+
+        for layer_name in layers:
+            cmd = f'{blender} -b "{blend_file}"'
+            if scene_name:
+                cmd += f' -S "{scene_name}"'
+            if layer_name:
+                cmd += f' -L "{layer_name}"'
+            if file_data.output_path:
+                cmd += f' -o "{file_data.output_path}"'
+            if file_data.output_format:
+                cmd += f' -F {file_data.output_format}'
+            if file_data.use_nodes:
+                cmd += ' --use-nodes'
+            cmd += ' -f @#@'
+
+            block_name = scene_name or "render"
+            if layer_name:
+                block_name = f"{block_name}_{layer_name}"
+
+            block = af.Block(block_name, 'blender')
+            block.setCommand(cmd, prefix=False)
+            block.setNumeric(
+                file_data.frame_start,
+                file_data.frame_end,
+                file_data.frames_per_task,
+                file_data.frame_step,
+            )
+            block.setWorkingDirectory(os.path.dirname(blend_file))
+            job.blocks.append(block)
 
     return job.send(verbose=False)
 
@@ -470,11 +331,8 @@ class FilePanel(QWidget):
         self.scan_btn = QPushButton("Scan")
         self.scan_btn.clicked.connect(self._scan_directory)
         row1.addWidget(self.scan_btn)
-        self.inspect_selected_btn = QPushButton("Inspect Selected")
-        self.inspect_selected_btn.setToolTip("Inspect checked files (Ctrl+I)")
-        row1.addWidget(self.inspect_selected_btn)
-        self.inspect_all_btn = QPushButton("Inspect All")
-        row1.addWidget(self.inspect_all_btn)
+        self.inspect_btn = QPushButton("Inspect All")
+        row1.addWidget(self.inspect_btn)
         layout.addLayout(row1)
 
         # Row 2: filter + select all/none
@@ -512,7 +370,6 @@ class FilePanel(QWidget):
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.cellClicked.connect(self._on_cell_clicked)
-        self.table.itemChanged.connect(self._update_inspect_button_text)
         layout.addWidget(self.table)
 
     def _browse_directory(self):
@@ -579,20 +436,11 @@ class FilePanel(QWidget):
                     paths.append(item.data(Qt.ItemDataRole.UserRole))
         return paths
 
-    def update_file_row(self, filepath: str, scene: str, frames: str, engine: str, status: str,
-                       error: bool = False, scene_tooltip: str = "", blender_version: str = ""):
+    def update_file_row(self, filepath: str, scene: str, frames: str, engine: str, status: str, error: bool = False):
         for row in range(self.table.rowCount()):
             item = self.table.item(row, self.COL_FILENAME)
             if item and item.data(Qt.ItemDataRole.UserRole) == filepath:
-                # Update filename tooltip with version info
-                if blender_version:
-                    filename_tooltip = f"{filepath}\nBlender {blender_version}"
-                    item.setToolTip(filename_tooltip)
-
-                scene_item = self.table.item(row, self.COL_SCENE)
-                scene_item.setText(scene)
-                if scene_tooltip:
-                    scene_item.setToolTip(scene_tooltip)
+                self.table.item(row, self.COL_SCENE).setText(scene)
                 self.table.item(row, self.COL_FRAMES).setText(frames)
                 self.table.item(row, self.COL_ENGINE).setText(engine)
                 status_item = self.table.item(row, self.COL_STATUS)
@@ -617,7 +465,6 @@ class FilePanel(QWidget):
                 item = self.table.item(row, self.COL_CHECK)
                 if item:
                     item.setCheckState(state)
-        self._update_inspect_button_text()
 
     def _apply_filter(self, text: str):
         text = text.lower()
@@ -632,14 +479,6 @@ class FilePanel(QWidget):
         item = self.table.item(row, self.COL_FILENAME)
         if item:
             self.file_selected.emit(item.data(Qt.ItemDataRole.UserRole))
-
-    def _update_inspect_button_text(self):
-        """Update Inspect Selected button text with checked file count."""
-        checked_count = len(self.get_checked_filepaths())
-        if checked_count > 0:
-            self.inspect_selected_btn.setText(f"Inspect Selected ({checked_count})")
-        else:
-            self.inspect_selected_btn.setText("Inspect Selected")
 
 
 # ---------------------------------------------------------------------------
@@ -714,9 +553,7 @@ class RenderSettingsTab(QWidget):
     def __init__(self):
         super().__init__()
         self._updating = False
-        self._current_file_data = None  # Reference to current file being edited
         self._build_ui()
-        self._connect_override_tracking()
 
     def _build_ui(self):
         layout = QFormLayout(self)
@@ -727,38 +564,10 @@ class RenderSettingsTab(QWidget):
         self.scene_combo.currentTextChanged.connect(self._on_scene_changed)
         layout.addRow("Scene:", self.scene_combo)
 
-        # View layers with check/uncheck buttons
-        layers_container = QWidget()
-        layers_layout = QVBoxLayout(layers_container)
-        layers_layout.setContentsMargins(0, 0, 0, 0)
-
-        # Button row
-        layers_buttons = QHBoxLayout()
-        self.check_all_layers_btn = QPushButton("Check All")
-        self.check_all_layers_btn.clicked.connect(self._check_all_layers)
-        self.uncheck_all_layers_btn = QPushButton("Uncheck All")
-        self.uncheck_all_layers_btn.clicked.connect(self._uncheck_all_layers)
-        layers_buttons.addWidget(self.check_all_layers_btn)
-        layers_buttons.addWidget(self.uncheck_all_layers_btn)
-        layers_buttons.addStretch()
-        layers_layout.addLayout(layers_buttons)
-
-        # Layers list
+        # View layers
         self.layers_list = QListWidget()
         self.layers_list.setMaximumHeight(100)
-        layers_layout.addWidget(self.layers_list)
-
-        layout.addRow("View Layers:", layers_container)
-
-        # Parallel rendering mode
-        self.parallel_layers_check = QCheckBox("Render layers in separate blocks (parallel)")
-        self.parallel_layers_check.setChecked(False)  # Default to unchecked
-        self.parallel_layers_check.setToolTip(
-            "ON (default): Each view layer renders as a separate block, allowing parallel rendering on different farm nodes.\n"
-            "OFF: All selected layers render in one block sequentially, reducing job tree complexity."
-        )
-        self.parallel_layers_check.stateChanged.connect(self._on_parallel_mode_changed)
-        layout.addRow("", self.parallel_layers_check)
+        layout.addRow("View Layers:", self.layers_list)
 
         # Frame range
         frame_group = QHBoxLayout()
@@ -793,9 +602,11 @@ class RenderSettingsTab(QWidget):
         # Render engine (read-only)
         self.engine_label = QLabel("-")
         layout.addRow("Render Engine:", self.engine_label)
-
-        # Note: Compositing (scene.use_nodes) is controlled by the blend file
-        # No command line flag exists to override it
+        
+        # Compositing checkbox
+        self.use_nodes_check = QCheckBox("Enable Compositing (use_nodes)")
+        self.use_nodes_check.setToolTip("Use compositing nodes when rendering")
+        layout.addRow("", self.use_nodes_check)
 
         # Output
         out_row = QHBoxLayout()
@@ -814,16 +625,6 @@ class RenderSettingsTab(QWidget):
         ])
         layout.addRow("Output Format:", self.format_combo)
 
-        # Reset overrides button
-        reset_row = QHBoxLayout()
-        self.reset_btn = QPushButton("Reset to File Settings")
-        self.reset_btn.setToolTip("Clear manual overrides and reload settings from blend file")
-        self.reset_btn.clicked.connect(self._reset_overrides)
-        self.reset_btn.setEnabled(False)  # Enabled when overrides exist
-        reset_row.addWidget(self.reset_btn)
-        reset_row.addStretch()
-        layout.addRow("", reset_row)
-
         # Calculated info
         self.resolution_label = QLabel("-")
         layout.addRow("Resolution:", self.resolution_label)
@@ -835,61 +636,20 @@ class RenderSettingsTab(QWidget):
         # Store scenes data for switching
         self._scenes_data = []
 
-    def _connect_override_tracking(self):
-        """Connect widget signals to track user overrides."""
-        # Frame range overrides
-        self.frame_start_spin.valueChanged.connect(lambda: self._mark_override("frame_start"))
-        self.frame_end_spin.valueChanged.connect(lambda: self._mark_override("frame_end"))
-        self.frame_step_spin.valueChanged.connect(lambda: self._mark_override("frame_step"))
-        self.fpt_spin.valueChanged.connect(lambda: self._mark_override("frames_per_task"))
-
-        # Output overrides
-        self.output_edit.textChanged.connect(lambda: self._mark_override("output_path"))
-        self.format_combo.currentTextChanged.connect(lambda: self._mark_override("output_format"))
-
-        # Note: selected_scene and selected_layers are handled separately as they're
-        # user selections by nature, not overrides
-
-    def _mark_override(self, field_name: str):
-        """Mark a field as manually overridden by user."""
-        # Only mark as override if not during programmatic update
-        if not self._updating and self._current_file_data:
-            self._current_file_data.user_overrides.add(field_name)
-            # Enable reset button when overrides exist
-            self.reset_btn.setEnabled(True)
-            self.reset_btn.setStyleSheet("background-color: #ff9800; color: white;")  # Orange highlight
-
-    def _reset_overrides(self):
-        """Clear all user overrides and reload settings from file."""
-        if not self._current_file_data:
-            return
-
-        # Clear overrides
-        self._current_file_data.user_overrides.clear()
-
-        # Reload from file data (this will now update all fields)
-        self.populate_from_file(self._current_file_data)
-
-        # Disable reset button
-        self.reset_btn.setEnabled(False)
-        self.reset_btn.setStyleSheet("")  # Reset style
-
     def populate_from_file(self, file_data: BlendFileData):
         self._updating = True
-        self._current_file_data = file_data  # Store reference for override tracking
         self._scenes_data = file_data.scenes
-        overrides = file_data.user_overrides
 
-        # Populate scene combo (always update - scene selection is not overrideable)
+        # Populate scene combo
         self.scene_combo.clear()
         if file_data.scenes:
             # Add "All Scenes" option if multiple scenes exist
             if len(file_data.scenes) > 1:
                 self.scene_combo.addItem("⚡ All Scenes")
-
+            
             for s in file_data.scenes:
                 self.scene_combo.addItem(s["name"])
-
+            
             if file_data.selected_scene:
                 idx = self.scene_combo.findText(file_data.selected_scene)
                 if idx >= 0:
@@ -897,41 +657,22 @@ class RenderSettingsTab(QWidget):
         else:
             self.scene_combo.addItem("(no scenes detected)")
 
-        # Only update fields that haven't been manually overridden
-        if "frame_start" not in overrides:
-            self.frame_start_spin.setValue(file_data.frame_start)
-        if "frame_end" not in overrides:
-            self.frame_end_spin.setValue(file_data.frame_end)
-        if "frame_step" not in overrides:
-            self.frame_step_spin.setValue(file_data.frame_step)
-        if "frames_per_task" not in overrides:
-            self.fpt_spin.setValue(file_data.frames_per_task)
-
-        # Always update read-only fields
+        self.frame_start_spin.setValue(file_data.frame_start)
+        self.frame_end_spin.setValue(file_data.frame_end)
+        self.frame_step_spin.setValue(file_data.frame_step)
+        self.fpt_spin.setValue(file_data.frames_per_task)
         self.engine_label.setText(file_data.render_engine or "-")
+        self.use_nodes_check.setChecked(file_data.use_nodes)
+        self.output_edit.setText(file_data.output_path)
         self.resolution_label.setText(f"{file_data.resolution_x} x {file_data.resolution_y}")
 
-        # Only update output fields if not overridden
-        if "output_path" not in overrides:
-            self.output_edit.setText(file_data.output_path)
-        if "output_format" not in overrides:
-            idx = self.format_combo.findText(file_data.output_format)
-            if idx >= 0:
-                self.format_combo.setCurrentIndex(idx)
+        # Set output format
+        idx = self.format_combo.findText(file_data.output_format)
+        if idx >= 0:
+            self.format_combo.setCurrentIndex(idx)
 
-        # Populate layers (always update - layer selection is not overrideable)
+        # Populate layers
         self._populate_layers(file_data.selected_layers)
-
-        # Update reset button state
-        if overrides:
-            self.reset_btn.setEnabled(True)
-            self.reset_btn.setStyleSheet("background-color: #ff9800; color: white;")
-        else:
-            self.reset_btn.setEnabled(False)
-            self.reset_btn.setStyleSheet("")
-
-        # Set parallel rendering checkbox
-        self.parallel_layers_check.setChecked(file_data.render_layers_parallel)
 
         self._updating = False
         self._update_calculated()
@@ -939,79 +680,25 @@ class RenderSettingsTab(QWidget):
     def _populate_layers(self, selected_layers: list):
         self.layers_list.clear()
         scene_name = self.scene_combo.currentText()
-
+        
         # Special handling for "All Scenes"
         if scene_name == "⚡ All Scenes":
             # Show note that all scene layers will be rendered
             item = QListWidgetItem("(All scenes & layers will be rendered)")
             item.setFlags(Qt.ItemFlag.NoItemFlags)  # Not selectable
             self.layers_list.addItem(item)
-            self._update_layer_button_state()
             return
-
+        
         scene_data = next((s for s in self._scenes_data if s["name"] == scene_name), None)
         if scene_data and scene_data.get("view_layers"):
-            for layer_data in scene_data["view_layers"]:
-                # Handle both old string format and new dict format
-                if isinstance(layer_data, dict):
-                    layer_name = layer_data.get("name", "")
-                    layer_use = layer_data.get("use", True)  # Is this layer enabled for rendering?
-                else:
-                    layer_name = layer_data
-                    layer_use = True  # Default to enabled for old format
-
-                item = QListWidgetItem(layer_name)
-
-                if layer_use:
-                    # Layer is enabled: make it checkable
-                    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                    # Auto-check if in selected_layers or no layers selected yet
-                    should_check = layer_name in selected_layers or not selected_layers
-                    item.setCheckState(
-                        Qt.CheckState.Checked if should_check else Qt.CheckState.Unchecked
-                    )
-                else:
-                    # Layer is DISABLED: make it NOT checkable to prevent black frame renders
-                    # Remove checkable flag so user cannot accidentally enable it
-                    item.setFlags(Qt.ItemFlag.ItemIsEnabled)  # Can see but not interact
-                    item.setForeground(QColor("#888"))  # Gray out disabled layers
-                    item.setToolTip(
-                        f"⚠️ {layer_name} is disabled for rendering in blend file\n"
-                        f"(Enabling it could cause black frames with compositor nodes)"
-                    )
-
+            for layer in scene_data["view_layers"]:
+                item = QListWidgetItem(layer)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(
+                    Qt.CheckState.Checked if layer in selected_layers or not selected_layers
+                    else Qt.CheckState.Unchecked
+                )
                 self.layers_list.addItem(item)
-
-        # Update button state at the end
-        self._update_layer_button_state()
-
-    def _check_all_layers(self):
-        """Check all view layers in the list."""
-        for i in range(self.layers_list.count()):
-            item = self.layers_list.item(i)
-            if item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
-                item.setCheckState(Qt.CheckState.Checked)
-
-    def _uncheck_all_layers(self):
-        """Uncheck all view layers in the list."""
-        for i in range(self.layers_list.count()):
-            item = self.layers_list.item(i)
-            if item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
-                item.setCheckState(Qt.CheckState.Unchecked)
-
-    def _update_layer_button_state(self):
-        """Enable/disable layer buttons based on list contents."""
-        # Count checkable items (exclude "All Scenes" placeholder)
-        checkable_count = 0
-        for i in range(self.layers_list.count()):
-            item = self.layers_list.item(i)
-            if item.flags() & Qt.ItemFlag.ItemIsUserCheckable:
-                checkable_count += 1
-
-        # Enable buttons only if there are checkable items
-        enabled = checkable_count > 0
-        self.check_all_layers_btn.setEnabled(enabled)
-        self.uncheck_all_layers_btn.setEnabled(enabled)
 
     def _on_scene_changed(self, scene_name: str):
         if self._updating:
@@ -1040,7 +727,7 @@ class RenderSettingsTab(QWidget):
             self.frame_end_spin.setValue(scene_data["frame_end"])
             self.frame_step_spin.setValue(scene_data.get("frame_step", 1))
             self.engine_label.setText(scene_data.get("render_engine", "-"))
-            # Compositing controlled by blend file (no UI override)
+            self.use_nodes_check.setChecked(scene_data.get("use_nodes", False))
             self.output_edit.setText(scene_data.get("output_path", ""))
             self.resolution_label.setText(
                 f"{scene_data.get('resolution_x', '?')} x {scene_data.get('resolution_y', '?')}"
@@ -1051,11 +738,6 @@ class RenderSettingsTab(QWidget):
                 self.format_combo.setCurrentIndex(idx)
             self._populate_layers(scene_data.get("view_layers", []))
             self._update_calculated()
-
-    def _on_parallel_mode_changed(self, _state):
-        """Handle changes to parallel rendering mode checkbox."""
-        if not self._updating and self._current_file_data:
-            self._current_file_data.render_layers_parallel = self.parallel_layers_check.isChecked()
 
     def _update_calculated(self):
         scene_name = self.scene_combo.currentText()
@@ -1100,12 +782,8 @@ class RenderSettingsTab(QWidget):
         layers = []
         for i in range(self.layers_list.count()):
             item = self.layers_list.item(i)
-            # Only check state if item is checkable
-            if (item.flags() & Qt.ItemFlag.ItemIsUserCheckable) and \
-               (item.checkState() == Qt.CheckState.Checked):
-                layer_text = item.text().strip()
-                if layer_text:  # Only add non-empty layer names
-                    layers.append(layer_text)
+            if item.checkState() == Qt.CheckState.Checked:
+                layers.append(item.text())
         return layers
 
     def apply_to_file_data(self, file_data: BlendFileData):
@@ -1117,8 +795,7 @@ class RenderSettingsTab(QWidget):
         file_data.frames_per_task = self.fpt_spin.value()
         file_data.output_path = self.output_edit.text()
         file_data.output_format = self.format_combo.currentText()
-        file_data.render_layers_parallel = self.parallel_layers_check.isChecked()
-        # Compositing (use_nodes) controlled by blend file, not user-editable
+        file_data.use_nodes = self.use_nodes_check.isChecked()
 
 
 # ---------------------------------------------------------------------------
@@ -1128,15 +805,7 @@ class RenderSettingsTab(QWidget):
 class AppSettingsTab(QWidget):
     def __init__(self):
         super().__init__()
-        # Pre-create jobid combo before UI build so it always exists
-        self.cleanup_jobid_combo = QComboBox()
-        self.cleanup_jobid_combo.setEditable(True)
-        self.cleanup_jobid_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.cleanup_jobid_combo.setMinimumWidth(100)
-        self.cleanup_jobid_combo.setPlaceholderText("Job ID")
         self._build_ui()
-        # Connect signal for auto job_id detection (only once, after UI is built)
-        self.cleanup_blend_combo.currentTextChanged.connect(self._auto_detect_job_ids)
 
     def _build_ui(self):
         layout = QFormLayout(self)
@@ -1152,95 +821,19 @@ class AppSettingsTab(QWidget):
         blender_row.addWidget(self.blender_browse_btn)
         layout.addRow("Blender Path:", blender_row)
 
-        # --- Job ID txt cleanup UI ---
-        cleanup_row = QHBoxLayout()
-        self.cleanup_blend_combo = QComboBox()
-        self.cleanup_blend_combo.setEditable(True)
-        self.cleanup_blend_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.cleanup_blend_combo.setMinimumWidth(220)
-        self.cleanup_blend_combo.setPlaceholderText("Select or browse .blend file...")
-        cleanup_row.addWidget(self.cleanup_blend_combo, 1)
-        self.cleanup_blend_btn = QPushButton("Browse")
-        self.cleanup_blend_btn.clicked.connect(self._browse_cleanup_blend)
-        cleanup_row.addWidget(self.cleanup_blend_btn)
-        self.reload_jobid_btn = QPushButton("Reload")
-        self.reload_jobid_btn.setToolTip("Reload job IDs from job_id folder for selected blend file")
-        self.reload_jobid_btn.setFixedWidth(64)
-        self.reload_jobid_btn.clicked.connect(self._reload_job_ids)
-        cleanup_row.addWidget(self.reload_jobid_btn)
-        cleanup_row.addWidget(self.cleanup_jobid_combo)
-        self.cleanup_btn = QPushButton("Delete job_id txt")
-        self.cleanup_btn.clicked.connect(self._cleanup_job_id_txt)
-        cleanup_row.addWidget(self.cleanup_btn)
-        layout.addRow("Cleanup job_id txt:", cleanup_row)
+        # Afanasy server (read-only display)
+        self.server_label = QLabel(config.AFANASY_SERVER or "(not configured)")
+        layout.addRow("Afanasy Server:", self.server_label)
 
-    def _reload_job_ids(self):
-        blend_path = self.cleanup_blend_combo.currentText().strip()
-        self._auto_detect_job_ids(blend_path)
-        
-    def update_cleanup_blend_list(self, blend_filepaths: list):
-        self.cleanup_blend_combo.clear()
-        self.cleanup_blend_combo.addItems(blend_filepaths)
-        self.cleanup_blend_combo.setCurrentIndex(-1)
-        if hasattr(self, 'cleanup_jobid_combo'):
-            self.cleanup_jobid_combo.clear()
+        self.port_label = QLabel(str(config.AFANASY_PORT) if config.AFANASY_PORT else "(not configured)")
+        layout.addRow("Afanasy Port:", self.port_label)
 
-    def _auto_detect_job_ids(self, blend_path):
-        import os, re
-        if not hasattr(self, 'cleanup_jobid_combo'):
-            return
-        self.cleanup_jobid_combo.clear()
-        blend_path = blend_path.strip()
-        if not blend_path or not os.path.isfile(blend_path):
-            self.cleanup_jobid_combo.addItem("No job_id found")
-            return
-        blend_dir = os.path.dirname(blend_path)
-        job_id_dir = os.path.join(blend_dir, "job_id")
-        job_name = os.path.basename(blend_path).replace(".blend", "")
-        if not os.path.isdir(job_id_dir):
-            self.cleanup_jobid_combo.addItem("No job_id found")
-            return
-        job_ids = []
-        for fname in os.listdir(job_id_dir):
-            if fname.startswith(job_name + "_jobID_") and fname.endswith(".txt"):
-                m = re.match(rf"{re.escape(job_name)}_jobID_(.+)\.txt", fname)
-                if m:
-                    job_ids.append(m.group(1))
-        if job_ids:
-            self.cleanup_jobid_combo.clear()
-            self.cleanup_jobid_combo.addItems(sorted(job_ids, key=lambda x: int(x) if x.isdigit() else x))
-            self.cleanup_jobid_combo.setCurrentIndex(0)
-        else:
-            self.cleanup_jobid_combo.clear()
-            self.cleanup_jobid_combo.addItem("No job_id found")
-        self.cleanup_jobid_combo.update()
-    def _browse_cleanup_blend(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select Blend File",
-            self.cleanup_blend_combo.currentText(),
-            "Blender Files (*.blend);;All Files (*)"
-        )
-        if path:
-            idx = self.cleanup_blend_combo.findText(path)
-            if idx == -1:
-                self.cleanup_blend_combo.addItem(path)
-            self.cleanup_blend_combo.setCurrentText(path)
-            self._auto_detect_job_ids(path)
-
-    def _cleanup_job_id_txt(self):
-        filepath = self.cleanup_blend_combo.currentText().strip()
-        job_id = self.cleanup_jobid_combo.currentText().strip()
-        if not filepath or not job_id:
-            QMessageBox.warning(self, "Missing Info", "Please select a .blend file and enter a Job ID.")
-            return
-        try:
-            remove_job_id_txt(filepath, job_id)
-            QMessageBox.information(self, "Cleanup Complete", f"job_id txt for Job ID {job_id} removed (if existed).")
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"Failed to remove job_id txt: {e}")
-
-
-    # (UI built earlier in __init__ - duplicate method removed)
+        # Spacer
+        layout.addRow(QLabel(""))
+        info = QLabel("Blender path is used for:\n- Inspecting .blend files (auto-detect metadata)\n- The render command sent to farm nodes")
+        info.setStyleSheet("color: #777; font-style: italic;")
+        info.setWordWrap(True)
+        layout.addRow(info)
 
     def _browse_blender(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1305,26 +898,16 @@ class SubmissionPanel(QWidget):
 # Main Window
 # ---------------------------------------------------------------------------
 
-
 class MainWindow(QMainWindow):
-    def update_cleanup_blend_list(self):
-        if hasattr(self, 'file_panel') and hasattr(self, 'app_tab'):
-            blend_files = self.file_panel.get_all_filepaths()
-            self.app_tab.update_cleanup_blend_list(blend_files)
-
-    def cleanup_job_id_txt(self, filepath, job_id):
-        """Public method to remove job_id txt file after job deletion."""
-        remove_job_id_txt(filepath, job_id)
-
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Batch Submitter - Blender to Afanasy")
         self.setMinimumSize(900, 700)
 
-        self.file_data = {}
-        self.current_filepath = ""
-        self.inspector_thread = None
-        self.submit_thread = None
+        self.file_data: dict[str, BlendFileData] = {}
+        self.current_filepath: str = ""
+        self.inspector_thread: Optional[InspectorThread] = None
+        self.submit_thread: Optional[SubmitThread] = None
 
         self._build_ui()
         self._load_settings()
@@ -1342,9 +925,7 @@ class MainWindow(QMainWindow):
         # File panel
         self.file_panel = FilePanel()
         self.file_panel.file_selected.connect(self._on_file_selected)
-        self.file_panel.inspect_selected_btn.clicked.connect(self._inspect_selected)
-        self.file_panel.inspect_all_btn.clicked.connect(self._inspect_all)
-        self.file_panel.scan_btn.clicked.connect(self.update_cleanup_blend_list)
+        self.file_panel.inspect_btn.clicked.connect(self._inspect_all)
         splitter.addWidget(self.file_panel)
 
         # Settings tabs
@@ -1368,10 +949,6 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(2, 1)
 
         main_layout.addWidget(splitter)
-
-        # Keyboard shortcuts
-        inspect_shortcut = QShortcut(QKeySequence("Ctrl+I"), self)
-        inspect_shortcut.activated.connect(self._inspect_selected)
 
     # --- Settings persistence ---
 
@@ -1426,46 +1003,8 @@ class MainWindow(QMainWindow):
 
     # --- Inspect ---
 
-    def _format_scene_display(self, scenes: list, selected_scene: str) -> str:
-        """Format scene name for table display.
-
-        Shows:
-        - Single scene: "Scene"
-        - Multiple scenes: "_Main +2" or "Scene (3)"
-        """
-        if not scenes:
-            return "-"
-
-        if len(scenes) == 1:
-            return scenes[0]["name"]
-
-        # Multiple scenes: show first/selected scene + count
-        first_scene = selected_scene if selected_scene else scenes[0]["name"]
-        extra_count = len(scenes) - 1
-        return f"{first_scene} +{extra_count}"
-
-    def _format_scene_tooltip(self, scenes: list) -> str:
-        """Format tooltip showing all scene names."""
-        if not scenes:
-            return ""
-        return "\n".join(s["name"] for s in scenes)
-
     def _get_blender_path(self) -> str:
         return self.app_tab.blender_edit.text().strip()
-
-    def _inspect_selected(self):
-        blender = self._get_blender_path()
-        if not blender:
-            QMessageBox.warning(self, "Blender Path", "Set the Blender executable path in App Settings first.")
-            self.tabs.setCurrentWidget(self.app_tab)
-            return
-
-        files = self.file_panel.get_checked_filepaths()
-        if not files:
-            QMessageBox.information(self, "No Files Selected", "Please check at least one file to inspect.")
-            return
-
-        self._run_inspection(files)
 
     def _inspect_all(self):
         blender = self._get_blender_path()
@@ -1478,22 +1017,14 @@ class MainWindow(QMainWindow):
         if not files:
             return
 
-        self._run_inspection(files)
-
-    def _run_inspection(self, files: list):
-        """Common inspection logic for both Inspect Selected and Inspect All."""
-        blender = self._get_blender_path()
         inspector_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blend_inspector.py")
 
         # Mark all as inspecting
         for f in files:
             self.file_panel.set_row_status(f, "Inspecting...")
 
-        # Disable both buttons during inspection
-        self.file_panel.inspect_selected_btn.setEnabled(False)
-        self.file_panel.inspect_selected_btn.setText("Inspecting...")
-        self.file_panel.inspect_all_btn.setEnabled(False)
-        self.file_panel.inspect_all_btn.setText("Inspecting...")
+        self.file_panel.inspect_btn.setEnabled(False)
+        self.file_panel.inspect_btn.setText("Inspecting...")
 
         self.inspector_thread = InspectorThread(files, blender, inspector_script)
         self.inspector_thread.file_inspected.connect(self._on_file_inspected)
@@ -1515,25 +1046,13 @@ class MainWindow(QMainWindow):
         scenes = metadata.get("scenes", [])
         first_scene = scenes[0] if scenes else {}
 
-        # Extract layer names from view_layers (which may be dicts or strings)
-        view_layers_data = first_scene.get("view_layers", [])
-        enabled_layer_names = []
-        for layer_data in view_layers_data:
-            if isinstance(layer_data, dict):
-                # Only include layers that are enabled for rendering
-                if layer_data.get("use", True):
-                    enabled_layer_names.append(layer_data.get("name", ""))
-            else:
-                # Old string format
-                enabled_layer_names.append(layer_data)
-
         fd = BlendFileData(
             filepath=filepath,
             job_name=metadata.get("job_name", os.path.basename(filepath).replace(".blend", "")),
             inspected=True,
             scenes=scenes,
             selected_scene=first_scene.get("name", ""),
-            selected_layers=enabled_layer_names,
+            selected_layers=first_scene.get("view_layers", []),
             frame_start=first_scene.get("frame_start", 1),
             frame_end=first_scene.get("frame_end", 250),
             frame_step=first_scene.get("frame_step", 1),
@@ -1544,20 +1063,12 @@ class MainWindow(QMainWindow):
             output_path=first_scene.get("output_path", ""),
             output_format=first_scene.get("output_format", "OPEN_EXR"),
             use_nodes=first_scene.get("use_nodes", False),
-            blender_version=metadata.get("blender_version", "Unknown"),
         )
         self.file_data[filepath] = fd
 
         frames_str = f"{fd.frame_start}-{fd.frame_end}"
         engine_short = fd.render_engine.replace("BLENDER_", "").replace("_NEXT", "+")
-
-        # Format scene display and tooltip
-        scene_display = self._format_scene_display(fd.scenes, fd.selected_scene)
-        scene_tooltip = self._format_scene_tooltip(fd.scenes)
-
-        self.file_panel.update_file_row(filepath, scene_display, frames_str, engine_short, "Inspected",
-                                       error=False, scene_tooltip=scene_tooltip,
-                                       blender_version=fd.blender_version)
+        self.file_panel.update_file_row(filepath, fd.selected_scene, frames_str, engine_short, "Inspected")
 
         # If this is the currently selected file, refresh the tabs
         if filepath == self.current_filepath:
@@ -1565,13 +1076,8 @@ class MainWindow(QMainWindow):
             self.render_tab.populate_from_file(fd)
 
     def _on_inspect_done(self):
-        self.file_panel.inspect_selected_btn.setEnabled(True)
-        self.file_panel.inspect_all_btn.setEnabled(True)
-        self.file_panel.inspect_all_btn.setText("Inspect All")
-        # Update Inspect Selected button text with current checked count
-        self.file_panel._update_inspect_button_text()
-        # Update cleanup blend dropdown after inspection
-        self.update_cleanup_blend_list()
+        self.file_panel.inspect_btn.setEnabled(True)
+        self.file_panel.inspect_btn.setText("Inspect All")
 
     # --- Submit ---
 
@@ -1591,24 +1097,6 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "No Files", "No files are selected for submission.")
             return
 
-        # Validate layer selection
-        validation_errors = []
-        for filepath in checked:
-            if filepath in self.file_data:
-                fd = self.file_data[filepath]
-                # Skip validation if "All Scenes" is selected (renders all layers automatically)
-                if fd.selected_scene != "⚡ All Scenes":
-                    # Check if at least one layer is selected
-                    if not fd.selected_layers or len(fd.selected_layers) == 0:
-                        filename = os.path.basename(filepath)
-                        validation_errors.append(f"{filename}: No view layers selected")
-
-        if validation_errors:
-            error_msg = "Cannot submit - please select at least one view layer for each file:\n\n"
-            error_msg += "\n".join(validation_errors)
-            QMessageBox.warning(self, "Layer Selection Required", error_msg)
-            return
-
         # Build job list
         job_settings = self.job_tab.get_settings()
         job_settings["blender_path"] = blender
@@ -1626,16 +1114,8 @@ class MainWindow(QMainWindow):
                 fd.job_name = os.path.basename(filepath).replace(".blend", "")
             jobs.append((filepath, fd, job_settings))
 
-        # Show submission summary
-        self.submission_panel.log_message(f"═══ Submitting {len(jobs)} job(s) ═══")
-        for filepath in checked:
-            if filepath in self.file_data:
-                fd = self.file_data[filepath]
-                filename = os.path.basename(filepath)
-                scene = fd.selected_scene if fd.selected_scene else "(default)"
-                layers_text = "all" if fd.selected_scene == "⚡ All Scenes" else str(len(fd.selected_layers)) if fd.selected_layers else "1"
-                self.submission_panel.log_message(f"  • {filename} - Scene: {scene}, Layers: {layers_text}")
-
+        self.submission_panel.clear_log()
+        self.submission_panel.log_message(f"Submitting {len(jobs)} job(s)...")
         self.submission_panel.progress.setVisible(True)
         self.submission_panel.progress.setMaximum(len(jobs))
         self.submission_panel.progress.setValue(0)
@@ -1651,44 +1131,14 @@ class MainWindow(QMainWindow):
         filename = os.path.basename(filepath)
         self._submitted_count += 1
         self.submission_panel.progress.setValue(self._submitted_count)
-
         if success:
-            # Show detailed submission info
-            if filepath in self.file_data:
-                fd = self.file_data[filepath]
-                scene_info = fd.selected_scene if fd.selected_scene else "(default)"
-
-                # Layer info
-                if fd.selected_scene == "⚡ All Scenes":
-                    layer_info = "all scenes & layers"
-                elif fd.selected_layers:
-                    layer_count = len(fd.selected_layers)
-                    if layer_count == 1:
-                        layer_info = fd.selected_layers[0]
-                    else:
-                        layer_info = f"{layer_count} layers"
-                else:
-                    layer_info = "(active layer)"
-
-                # Mode info
-                mode = "parallel" if fd.render_layers_parallel else "sequential"
-
-                # Frame info
-                frame_info = f"{fd.frame_start}-{fd.frame_end}"
-
-                self.submission_panel.log_message(
-                    f"✓ {filename} - {message}\n"
-                    f"  Scene: {scene_info} | Layers: {layer_info} | Mode: {mode} | Frames: {frame_info}"
-                )
-            else:
-                self.submission_panel.log_message(f"✓ {filename} - {message}")
+            self.submission_panel.log_message(f"{filename} - {message}")
         else:
-            self.submission_panel.log_message(f"✗ {filename} - FAILED: {message}", error=True)
+            self.submission_panel.log_message(f"{filename} - FAILED: {message}", error=True)
 
     def _on_submit_done(self):
         self.submission_panel.submit_btn.setEnabled(True)
-        self.submission_panel.progress.setVisible(False)
-        self.submission_panel.log_message("═══ All submissions complete ═══\n")
+        self.submission_panel.log_message("All submissions complete.")
 
 
 # ---------------------------------------------------------------------------
