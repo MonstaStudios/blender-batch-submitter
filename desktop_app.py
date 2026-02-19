@@ -1,3 +1,17 @@
+def remove_job_id_txt(filepath: str, job_id: str):
+    """Remove the job_id txt file for a given blend file and job_id."""
+    import os
+    blend_dir = os.path.dirname(filepath)
+    job_id_dir = os.path.join(blend_dir, "job_id")
+    job_name = os.path.basename(filepath).replace(".blend", "")
+    txt_filename = f"{job_name}_jobID_{job_id}.txt"
+    txt_path = os.path.join(job_id_dir, txt_filename)
+    if os.path.exists(txt_path):
+        try:
+            os.remove(txt_path)
+        except Exception:
+            pass
+
 """
 Batch Submitter - Blender to CGRU Afanasy Farm
 A standalone PyQt6 desktop application for submitting Blender render jobs
@@ -91,7 +105,7 @@ class BlendFileData:
     # Track which fields have been manually overridden by user
     user_overrides: set = field(default_factory=set)  # Set of field names
     # Render layer submission mode
-    render_layers_parallel: bool = True  # True = multi-block (default), False = single-block
+    render_layers_parallel: bool = False  # True = multi-block, False = single-block (default)
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +195,16 @@ class SubmitThread(QThread):
                     job_id = ""
                     if isinstance(result[1], dict) and "id" in result[1]:
                         job_id = result[1]["id"]
+                        # Write job_id txt file
+                        import os
+                        blend_dir = os.path.dirname(filepath)
+                        job_id_dir = os.path.join(blend_dir, "job_id")
+                        os.makedirs(job_id_dir, exist_ok=True)
+                        job_name = os.path.basename(filepath).replace(".blend", "")
+                        txt_filename = f"{job_name}_jobID_{job_id}.txt"
+                        txt_path = os.path.join(job_id_dir, txt_filename)
+                        with open(txt_path, "w") as f:
+                            f.write(f"Job Name: {job_name}\nJob ID: {job_id}\nBlend File: {filepath}\n")
                     self.job_submitted.emit(filepath, True, f"Submitted (ID: {job_id})")
                 else:
                     self.job_submitted.emit(filepath, False, "Server rejected job")
@@ -728,7 +752,7 @@ class RenderSettingsTab(QWidget):
 
         # Parallel rendering mode
         self.parallel_layers_check = QCheckBox("Render layers in separate blocks (parallel)")
-        self.parallel_layers_check.setChecked(True)  # Default to current behavior
+        self.parallel_layers_check.setChecked(False)  # Default to unchecked
         self.parallel_layers_check.setToolTip(
             "ON (default): Each view layer renders as a separate block, allowing parallel rendering on different farm nodes.\n"
             "OFF: All selected layers render in one block sequentially, reducing job tree complexity."
@@ -1104,7 +1128,15 @@ class RenderSettingsTab(QWidget):
 class AppSettingsTab(QWidget):
     def __init__(self):
         super().__init__()
+        # Pre-create jobid combo before UI build so it always exists
+        self.cleanup_jobid_combo = QComboBox()
+        self.cleanup_jobid_combo.setEditable(True)
+        self.cleanup_jobid_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.cleanup_jobid_combo.setMinimumWidth(100)
+        self.cleanup_jobid_combo.setPlaceholderText("Job ID")
         self._build_ui()
+        # Connect signal for auto job_id detection (only once, after UI is built)
+        self.cleanup_blend_combo.currentTextChanged.connect(self._auto_detect_job_ids)
 
     def _build_ui(self):
         layout = QFormLayout(self)
@@ -1120,19 +1152,95 @@ class AppSettingsTab(QWidget):
         blender_row.addWidget(self.blender_browse_btn)
         layout.addRow("Blender Path:", blender_row)
 
-        # Afanasy server (read-only display)
-        self.server_label = QLabel(config.AFANASY_SERVER or "(not configured)")
-        layout.addRow("Afanasy Server:", self.server_label)
+        # --- Job ID txt cleanup UI ---
+        cleanup_row = QHBoxLayout()
+        self.cleanup_blend_combo = QComboBox()
+        self.cleanup_blend_combo.setEditable(True)
+        self.cleanup_blend_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.cleanup_blend_combo.setMinimumWidth(220)
+        self.cleanup_blend_combo.setPlaceholderText("Select or browse .blend file...")
+        cleanup_row.addWidget(self.cleanup_blend_combo, 1)
+        self.cleanup_blend_btn = QPushButton("Browse")
+        self.cleanup_blend_btn.clicked.connect(self._browse_cleanup_blend)
+        cleanup_row.addWidget(self.cleanup_blend_btn)
+        self.reload_jobid_btn = QPushButton("Reload")
+        self.reload_jobid_btn.setToolTip("Reload job IDs from job_id folder for selected blend file")
+        self.reload_jobid_btn.setFixedWidth(64)
+        self.reload_jobid_btn.clicked.connect(self._reload_job_ids)
+        cleanup_row.addWidget(self.reload_jobid_btn)
+        cleanup_row.addWidget(self.cleanup_jobid_combo)
+        self.cleanup_btn = QPushButton("Delete job_id txt")
+        self.cleanup_btn.clicked.connect(self._cleanup_job_id_txt)
+        cleanup_row.addWidget(self.cleanup_btn)
+        layout.addRow("Cleanup job_id txt:", cleanup_row)
 
-        self.port_label = QLabel(str(config.AFANASY_PORT) if config.AFANASY_PORT else "(not configured)")
-        layout.addRow("Afanasy Port:", self.port_label)
+    def _reload_job_ids(self):
+        blend_path = self.cleanup_blend_combo.currentText().strip()
+        self._auto_detect_job_ids(blend_path)
+        
+    def update_cleanup_blend_list(self, blend_filepaths: list):
+        self.cleanup_blend_combo.clear()
+        self.cleanup_blend_combo.addItems(blend_filepaths)
+        self.cleanup_blend_combo.setCurrentIndex(-1)
+        if hasattr(self, 'cleanup_jobid_combo'):
+            self.cleanup_jobid_combo.clear()
 
-        # Spacer
-        layout.addRow(QLabel(""))
-        info = QLabel("Blender path is used for:\n- Inspecting .blend files (auto-detect metadata)\n- The render command sent to farm nodes")
-        info.setStyleSheet("color: #777; font-style: italic;")
-        info.setWordWrap(True)
-        layout.addRow(info)
+    def _auto_detect_job_ids(self, blend_path):
+        import os, re
+        if not hasattr(self, 'cleanup_jobid_combo'):
+            return
+        self.cleanup_jobid_combo.clear()
+        blend_path = blend_path.strip()
+        if not blend_path or not os.path.isfile(blend_path):
+            self.cleanup_jobid_combo.addItem("No job_id found")
+            return
+        blend_dir = os.path.dirname(blend_path)
+        job_id_dir = os.path.join(blend_dir, "job_id")
+        job_name = os.path.basename(blend_path).replace(".blend", "")
+        if not os.path.isdir(job_id_dir):
+            self.cleanup_jobid_combo.addItem("No job_id found")
+            return
+        job_ids = []
+        for fname in os.listdir(job_id_dir):
+            if fname.startswith(job_name + "_jobID_") and fname.endswith(".txt"):
+                m = re.match(rf"{re.escape(job_name)}_jobID_(.+)\.txt", fname)
+                if m:
+                    job_ids.append(m.group(1))
+        if job_ids:
+            self.cleanup_jobid_combo.clear()
+            self.cleanup_jobid_combo.addItems(sorted(job_ids, key=lambda x: int(x) if x.isdigit() else x))
+            self.cleanup_jobid_combo.setCurrentIndex(0)
+        else:
+            self.cleanup_jobid_combo.clear()
+            self.cleanup_jobid_combo.addItem("No job_id found")
+        self.cleanup_jobid_combo.update()
+    def _browse_cleanup_blend(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Blend File",
+            self.cleanup_blend_combo.currentText(),
+            "Blender Files (*.blend);;All Files (*)"
+        )
+        if path:
+            idx = self.cleanup_blend_combo.findText(path)
+            if idx == -1:
+                self.cleanup_blend_combo.addItem(path)
+            self.cleanup_blend_combo.setCurrentText(path)
+            self._auto_detect_job_ids(path)
+
+    def _cleanup_job_id_txt(self):
+        filepath = self.cleanup_blend_combo.currentText().strip()
+        job_id = self.cleanup_jobid_combo.currentText().strip()
+        if not filepath or not job_id:
+            QMessageBox.warning(self, "Missing Info", "Please select a .blend file and enter a Job ID.")
+            return
+        try:
+            remove_job_id_txt(filepath, job_id)
+            QMessageBox.information(self, "Cleanup Complete", f"job_id txt for Job ID {job_id} removed (if existed).")
+        except Exception as e:
+            QMessageBox.warning(self, "Error", f"Failed to remove job_id txt: {e}")
+
+
+    # (UI built earlier in __init__ - duplicate method removed)
 
     def _browse_blender(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1197,16 +1305,26 @@ class SubmissionPanel(QWidget):
 # Main Window
 # ---------------------------------------------------------------------------
 
+
 class MainWindow(QMainWindow):
+    def update_cleanup_blend_list(self):
+        if hasattr(self, 'file_panel') and hasattr(self, 'app_tab'):
+            blend_files = self.file_panel.get_all_filepaths()
+            self.app_tab.update_cleanup_blend_list(blend_files)
+
+    def cleanup_job_id_txt(self, filepath, job_id):
+        """Public method to remove job_id txt file after job deletion."""
+        remove_job_id_txt(filepath, job_id)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Batch Submitter - Blender to Afanasy")
         self.setMinimumSize(900, 700)
 
-        self.file_data: dict[str, BlendFileData] = {}
-        self.current_filepath: str = ""
-        self.inspector_thread: Optional[InspectorThread] = None
-        self.submit_thread: Optional[SubmitThread] = None
+        self.file_data = {}
+        self.current_filepath = ""
+        self.inspector_thread = None
+        self.submit_thread = None
 
         self._build_ui()
         self._load_settings()
@@ -1226,6 +1344,7 @@ class MainWindow(QMainWindow):
         self.file_panel.file_selected.connect(self._on_file_selected)
         self.file_panel.inspect_selected_btn.clicked.connect(self._inspect_selected)
         self.file_panel.inspect_all_btn.clicked.connect(self._inspect_all)
+        self.file_panel.scan_btn.clicked.connect(self.update_cleanup_blend_list)
         splitter.addWidget(self.file_panel)
 
         # Settings tabs
@@ -1451,6 +1570,8 @@ class MainWindow(QMainWindow):
         self.file_panel.inspect_all_btn.setText("Inspect All")
         # Update Inspect Selected button text with current checked count
         self.file_panel._update_inspect_button_text()
+        # Update cleanup blend dropdown after inspection
+        self.update_cleanup_blend_list()
 
     # --- Submit ---
 
