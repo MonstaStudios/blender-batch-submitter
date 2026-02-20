@@ -1,26 +1,15 @@
-def remove_job_id_txt(filepath: str, job_id: str):
-    """Remove the job_id txt file for a given blend file and job_id."""
-    import os
-    blend_dir = os.path.dirname(filepath)
-    job_id_dir = os.path.join(blend_dir, "job_id")
-    job_name = os.path.basename(filepath).replace(".blend", "")
-    txt_filename = f"{job_name}_jobID_{job_id}.txt"
-    txt_path = os.path.join(job_id_dir, txt_filename)
-    if os.path.exists(txt_path):
-        try:
-            os.remove(txt_path)
-        except Exception:
-            pass
-
 """
 Batch Submitter - Blender to CGRU Afanasy Farm
 A standalone PyQt6 desktop application for submitting Blender render jobs
 to the Afanasy render farm.
 """
+
+import re
 import os
 import sys
 import json
 import subprocess
+import shlex
 import math
 from dataclasses import dataclass, field
 from typing import Optional
@@ -67,12 +56,47 @@ from PyQt6.QtWidgets import (
     QTabWidget, QLabel, QLineEdit, QPushButton, QSpinBox,
     QCheckBox, QComboBox, QTextEdit, QProgressBar, QFileDialog,
     QFormLayout, QListWidget, QListWidgetItem, QAbstractItemView,
-    QMessageBox
+    QMessageBox, QDialog, QRadioButton, QButtonGroup, QGroupBox
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QTimer
 from PyQt6.QtGui import QFont, QColor, QPalette, QShortcut, QKeySequence
 
 import af
+
+def remove_job_id_txt(filepath: str, job_id: str):
+    """Remove the job_id txt file for a given blend file and job_id."""
+    blend_dir = os.path.dirname(filepath)
+    job_id_dir = os.path.join(blend_dir, "job_id")
+    job_name = os.path.basename(filepath).replace(".blend", "")
+    txt_filename = f"{job_name}_jobID_{job_id}.txt"
+    txt_path = os.path.join(job_id_dir, txt_filename)
+    if os.path.exists(txt_path):
+        try:
+            os.remove(txt_path)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+
+def quote_arg(arg: str) -> str:
+    """Quote a shell argument in an OS-aware manner.
+    
+    On POSIX systems (Linux, macOS): uses shlex.quote() with single quotes.
+    On Windows (nt): uses double quotes with proper escaping.
+    
+    This ensures commands work correctly on both Unix render nodes and Windows render nodes.
+    """
+    if os.name == 'nt':
+        # Windows command line: escape internal double quotes by doubling them
+        # Wrap in double quotes
+        escaped = arg.replace('"', '""')
+        return f'"{escaped}"'
+    else:
+        # POSIX systems: use shlex.quote() for proper shell escaping
+        return shlex.quote(arg)
 
 
 # ---------------------------------------------------------------------------
@@ -195,22 +219,75 @@ class SubmitThread(QThread):
                     job_id = ""
                     if isinstance(result[1], dict) and "id" in result[1]:
                         job_id = result[1]["id"]
-                        # Write job_id txt file
-                        import os
-                        blend_dir = os.path.dirname(filepath)
-                        job_id_dir = os.path.join(blend_dir, "job_id")
-                        os.makedirs(job_id_dir, exist_ok=True)
-                        job_name = os.path.basename(filepath).replace(".blend", "")
-                        txt_filename = f"{job_name}_jobID_{job_id}.txt"
-                        txt_path = os.path.join(job_id_dir, txt_filename)
-                        with open(txt_path, "w") as f:
-                            f.write(f"Job Name: {job_name}\nJob ID: {job_id}\nBlend File: {filepath}\n")
+                        # Write job_id txt file (in separate try-except to avoid failing the entire submission)
+                        try:
+                            blend_dir = os.path.dirname(filepath)
+                            job_id_dir = os.path.join(blend_dir, "job_id")
+                            os.makedirs(job_id_dir, exist_ok=True)
+                            job_name = os.path.basename(filepath).replace(".blend", "")
+                            txt_filename = f"{job_name}_jobID_{job_id}.txt"
+                            txt_path = os.path.join(job_id_dir, txt_filename)
+                            with open(txt_path, "w") as f:
+                                f.write(f"Job Name: {job_name}\nJob ID: {job_id}\nBlend File: {filepath}\n")
+                        except Exception as io_err:
+                            # File I/O error should not fail the job submission
+                            # Log it but still report the job as successfully submitted
+                            import logging
+                            logging.warning(f"Failed to write job_id txt file for {filepath}: {io_err}")
                     self.job_submitted.emit(filepath, True, f"Submitted (ID: {job_id})")
                 else:
                     self.job_submitted.emit(filepath, False, "Server rejected job")
             except Exception as e:
                 self.job_submitted.emit(filepath, False, str(e))
         self.all_done.emit()
+
+
+# ---------------------------------------------------------------------------
+# Job Fetch Thread
+# ---------------------------------------------------------------------------
+
+class JobFetchThread(QThread):
+    """Fetches job info or task output from Afanasy in the background."""
+    job_loaded    = pyqtSignal(dict)   # full job info dict
+    output_loaded = pyqtSignal(str)    # raw terminal text
+    error         = pyqtSignal(str)    # error message string
+
+    def __init__(self, job_id: int, mode: str,
+                 block_num: int = None, task_num: int = None):
+        """
+        mode: "job_info" | "task_output"
+        block_num / task_num: required for "task_output" mode
+        """
+        super().__init__()
+        self.job_id = job_id
+        self.mode = mode
+        self.block_num = block_num
+        self.task_num = task_num
+
+    def run(self):
+        try:
+            from afanasy_service_complete import AfanasyService
+            if self.mode == "job_info":
+                result = AfanasyService.get_job_by_id(self.job_id)
+                if result:
+                    self.job_loaded.emit(result)
+                else:
+                    self.error.emit(
+                        f"Job ID {self.job_id} not found on farm.\n"
+                        "The job may have been deleted. Try another ID."
+                    )
+            elif self.mode == "task_output":
+                result = AfanasyService.get_task_output(
+                    self.job_id, self.block_num, self.task_num
+                )
+                if result and "error" not in result:
+                    self.output_loaded.emit(result.get("output", ""))
+                elif result and "error" in result:
+                    self.error.emit(result["error"])
+                else:
+                    self.error.emit("Could not fetch task output.")
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -234,17 +311,17 @@ def _create_block_for_layer(
     Relies on blend file's view layer states (vl.use flags).
     Blender automatically renders all enabled layers.
     """
-    cmd = f'{blender} -b "{blend_file}" -y'
+    cmd = f'{quote_arg(blender)} -b {quote_arg(blend_file)} -y'
     if scene_name:
-        cmd += f' -S "{scene_name}"'
+        cmd += f' -S {quote_arg(scene_name)}'
 
     # Python expression removed - rely on blend file layer states
     # Blender renders all layers with vl.use=True automatically
 
     if output_path:
-        cmd += f' -o "{output_path}"'
+        cmd += f' -o {quote_arg(output_path)}'
     if output_format:
-        cmd += f' -F {output_format}'
+        cmd += f' -F {quote_arg(output_format)}'
 
     # Use animation rendering for proper frame iteration with Afanasy
     cmd += f' -s @#@ -e @#@ -j {frame_step} -a'
@@ -278,18 +355,18 @@ def _create_single_block_for_layers(
     Relies on blend file's view layer states (vl.use flags).
     Blender automatically renders all enabled layers and outputs each to its own path.
     """
-    cmd = f'{blender} -b "{blend_file}" -y'
+    cmd = f'{quote_arg(blender)} -b {quote_arg(blend_file)} -y'
     if scene_name:
-        cmd += f' -S "{scene_name}"'
+        cmd += f' -S {quote_arg(scene_name)}'
 
     # Python expression removed - rely on blend file layer states
     # Blender renders all layers with vl.use=True automatically
     # User controls layer states by editing the blend file before submission
 
     if output_path:
-        cmd += f' -o "{output_path}"'
+        cmd += f' -o {quote_arg(output_path)}'
     if output_format:
-        cmd += f' -F {output_format}'
+        cmd += f' -F {quote_arg(output_format)}'
 
     # Use animation rendering for proper frame iteration with Afanasy
     cmd += f' -s @#@ -e @#@ -j {frame_step} -a'
@@ -355,16 +432,11 @@ def _submit_all_scenes_mode(job: af.Job, blend_file: str, file_data: BlendFileDa
         # Extract enabled layer names
         layer_names = []
         for layer_data in scene_layers:
-            if isinstance(layer_data, dict):
-                layer_name = layer_data.get("name", "").strip()
-                layer_enabled = layer_data.get("use", True)
-                # Skip disabled layers to prevent black frame renders
-                if layer_enabled and layer_name:
-                    layer_names.append(layer_name)
-            elif isinstance(layer_data, str):
-                layer_name = layer_data.strip()
-                if layer_name:
-                    layer_names.append(layer_name)
+            layer_name = layer_data.get("name", "").strip()
+            layer_enabled = layer_data.get("use", True)
+            # Skip disabled layers to prevent black frame renders
+            if layer_enabled and layer_name:
+                layer_names.append(layer_name)
 
         if not layer_names:
             layer_names = [""]  # Render active layer
@@ -754,8 +826,8 @@ class RenderSettingsTab(QWidget):
         self.parallel_layers_check = QCheckBox("Render layers in separate blocks (parallel)")
         self.parallel_layers_check.setChecked(False)  # Default to unchecked
         self.parallel_layers_check.setToolTip(
-            "ON (default): Each view layer renders as a separate block, allowing parallel rendering on different farm nodes.\n"
-            "OFF: All selected layers render in one block sequentially, reducing job tree complexity."
+            "ON: Each view layer renders as a separate block, allowing parallel rendering on different farm nodes.\n"
+            "OFF(default): All selected layers render in one block sequentially, reducing job tree complexity."
         )
         self.parallel_layers_check.stateChanged.connect(self._on_parallel_mode_changed)
         layout.addRow("", self.parallel_layers_check)
@@ -952,13 +1024,8 @@ class RenderSettingsTab(QWidget):
         scene_data = next((s for s in self._scenes_data if s["name"] == scene_name), None)
         if scene_data and scene_data.get("view_layers"):
             for layer_data in scene_data["view_layers"]:
-                # Handle both old string format and new dict format
-                if isinstance(layer_data, dict):
-                    layer_name = layer_data.get("name", "")
-                    layer_use = layer_data.get("use", True)  # Is this layer enabled for rendering?
-                else:
-                    layer_name = layer_data
-                    layer_use = True  # Default to enabled for old format
+                layer_name = layer_data.get("name", "")
+                layer_use = layer_data.get("use", True)  # Is this layer enabled for rendering?
 
                 item = QListWidgetItem(layer_name)
 
@@ -1049,7 +1116,8 @@ class RenderSettingsTab(QWidget):
             idx = self.format_combo.findText(fmt)
             if idx >= 0:
                 self.format_combo.setCurrentIndex(idx)
-            self._populate_layers(scene_data.get("view_layers", []))
+            # Pass current selection (list of layer name strings) so _populate_layers can check matching layers
+            self._populate_layers(self._current_file_data.selected_layers)
             self._update_calculated()
 
     def _on_parallel_mode_changed(self, _state):
@@ -1186,7 +1254,7 @@ class AppSettingsTab(QWidget):
             self.cleanup_jobid_combo.clear()
 
     def _auto_detect_job_ids(self, blend_path):
-        import os, re
+        import re
         if not hasattr(self, 'cleanup_jobid_combo'):
             return
         self.cleanup_jobid_combo.clear()
@@ -1208,7 +1276,7 @@ class AppSettingsTab(QWidget):
                     job_ids.append(m.group(1))
         if job_ids:
             self.cleanup_jobid_combo.clear()
-            self.cleanup_jobid_combo.addItems(sorted(job_ids, key=lambda x: int(x) if x.isdigit() else x))
+            self.cleanup_jobid_combo.addItems(sorted(job_ids, key=lambda x: (0, int(x)) if x.isdigit() else (1, x)))
             self.cleanup_jobid_combo.setCurrentIndex(0)
         else:
             self.cleanup_jobid_combo.clear()
@@ -1253,6 +1321,643 @@ class AppSettingsTab(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Job Log Viewer Dialog
+# ---------------------------------------------------------------------------
+
+class JobLogDialog(QDialog):
+    """Standalone dialog for viewing Afanasy render job terminal output.
+
+    User flow:
+        1. Select a .blend file (from scanned list or browse)
+        2. Pick job ID detected from job_id/ folder (or enter manually)
+        3. Load job info from farm
+        4. Select scene (block) and layer
+        5. Choose output filter (full / errors only + crash.txt)
+        6. View color-highlighted output with copy/save/find/auto-refresh
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Job Log Viewer")
+        self.resize(1100, 750)
+        self.setMinimumSize(800, 500)
+
+        self._job_data = None          # cached job dict from Afanasy
+        self._scanned_files = []       # blend file paths from main window
+        self._current_job_id = None    # currently loaded job ID (int)
+        self._fetch_thread = None      # active JobFetchThread
+        self._refresh_threads = []     # list of threads for auto-refresh (prevent garbage collection)
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(10000)  # 10 s
+        self._refresh_timer.timeout.connect(self._refresh)
+
+        # Map (scene_str, layer_str) → (block_num, task_count)
+        self._scene_layer_map = {}
+
+        self._build_ui()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+
+        # ── Top: File + Job ID row ─────────────────────────────────────
+        top_row = QHBoxLayout()
+
+        top_row.addWidget(QLabel("File:"))
+        self.file_combo = QComboBox()
+        self.file_combo.setEditable(True)
+        self.file_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.file_combo.setMinimumWidth(280)
+        self.file_combo.setPlaceholderText("Select or browse .blend file…")
+        self.file_combo.currentTextChanged.connect(self._on_file_changed)
+        top_row.addWidget(self.file_combo, 2)
+
+        self.file_browse_btn = QPushButton("Browse…")
+        self.file_browse_btn.setFixedWidth(72)
+        self.file_browse_btn.clicked.connect(self._browse_file)
+        top_row.addWidget(self.file_browse_btn)
+
+        top_row.addSpacing(12)
+        top_row.addWidget(QLabel("Job ID:"))
+        self.job_id_combo = QComboBox()
+        self.job_id_combo.setEditable(True)
+        self.job_id_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.job_id_combo.setMinimumWidth(100)
+        self.job_id_combo.setPlaceholderText("ID…")
+        top_row.addWidget(self.job_id_combo, 1)
+
+        self.refresh_ids_btn = QPushButton("Reload IDs")
+        self.refresh_ids_btn.setFixedWidth(80)
+        self.refresh_ids_btn.clicked.connect(self._reload_job_ids)
+        top_row.addWidget(self.refresh_ids_btn)
+
+        self.load_job_btn = QPushButton("Load Job")
+        self.load_job_btn.setFixedWidth(76)
+        self.load_job_btn.setStyleSheet(
+            "QPushButton { background-color: #1976d2; color: white; "
+            "border-radius: 4px; padding: 4px 10px; }"
+            "QPushButton:hover { background-color: #2196f3; }"
+            "QPushButton:disabled { background-color: #444; color: #777; }"
+        )
+        self.load_job_btn.clicked.connect(self._on_load_job_clicked)
+        top_row.addWidget(self.load_job_btn)
+
+        root.addLayout(top_row)
+
+        # Warning label for missing job IDs
+        self.no_ids_label = QLabel("⚠  No job IDs found for this file. Enter an ID manually above.")
+        self.no_ids_label.setStyleSheet("color: #ffb300; font-size: 11px;")
+        self.no_ids_label.setVisible(False)
+        root.addWidget(self.no_ids_label)
+
+        # Error label for load failures
+        self.load_error_label = QLabel("")
+        self.load_error_label.setStyleSheet("color: #ef5350; font-size: 11px;")
+        self.load_error_label.setVisible(False)
+        root.addWidget(self.load_error_label)
+
+        # ── Middle: left filter panel + right output pane ──────────────
+        middle = QHBoxLayout()
+
+        # --- Left filter panel ---
+        filter_group = QGroupBox("Filter")
+        filter_group.setFixedWidth(270)
+        filter_layout = QVBoxLayout(filter_group)
+        filter_layout.setSpacing(6)
+
+        filter_layout.addWidget(QLabel("Block / Scene:"))
+        self.scene_combo = QComboBox()
+        self.scene_combo.setPlaceholderText("— load job first —")
+        self.scene_combo.setEnabled(False)
+        self.scene_combo.currentTextChanged.connect(self._on_scene_changed)
+        filter_layout.addWidget(self.scene_combo)
+
+        filter_layout.addWidget(QLabel("Task # (frame index, 0 = first):"))
+        self.task_spin = QSpinBox()
+        self.task_spin.setMinimum(0)
+        self.task_spin.setMaximum(9999)
+        self.task_spin.setValue(0)
+        self.task_spin.setToolTip("Task number within the selected block (0 = first frame)")
+        filter_layout.addWidget(self.task_spin)
+
+        self.show_output_btn = QPushButton("Show Output")
+        self.show_output_btn.setEnabled(False)
+        self.show_output_btn.clicked.connect(self._on_show_output_clicked)
+        filter_layout.addWidget(self.show_output_btn)
+
+        filter_layout.addSpacing(8)
+        filter_layout.addWidget(QLabel("Output filter:"))
+        self.filter_group_btn = QButtonGroup(self)
+        self.radio_full     = QRadioButton("Full terminal output")
+        self.radio_errors   = QRadioButton("Errors only")
+        self.radio_warnings = QRadioButton("Warnings only")
+        self.radio_saved    = QRadioButton("Saved + Time (frame result)")
+        self.radio_frames   = QRadioButton("Per frame (Fra: tiles)")
+        self.radio_full.setChecked(True)
+        for r in (self.radio_full, self.radio_errors, self.radio_warnings,
+                  self.radio_saved, self.radio_frames):
+            self.filter_group_btn.addButton(r)
+            filter_layout.addWidget(r)
+
+        self.crash_check = QCheckBox("Include crash.txt (if found)")
+        self.crash_check.setToolTip(
+            "Prepend crash.txt from the blend file directory if it exists"
+        )
+        filter_layout.addWidget(self.crash_check)
+
+        filter_layout.addSpacing(8)
+        filter_layout.addWidget(QLabel("Job status:"))
+        self.status_label = QLabel("—")
+        self.status_label.setWordWrap(True)
+        self.status_label.setStyleSheet("color: #b0b0b0; font-size: 11px;")
+        filter_layout.addWidget(self.status_label)
+
+        filter_layout.addStretch()
+        middle.addWidget(filter_group)
+
+        # --- Right output pane ---
+        output_widget = QWidget()
+        output_layout = QVBoxLayout(output_widget)
+        output_layout.setContentsMargins(0, 0, 0, 0)
+        output_layout.setSpacing(4)
+
+        self.output_edit = QTextEdit()
+        self.output_edit.setReadOnly(True)
+        mono = QFont("Monospace", 9)
+        mono.setStyleHint(QFont.StyleHint.Monospace)
+        self.output_edit.setFont(mono)
+        self.output_edit.setStyleSheet(
+            "QTextEdit { background-color: #1e1e1e; color: #b0b0b0; border: 1px solid #333; }"
+        )
+        output_layout.addWidget(self.output_edit)
+
+        # Find / copy / save toolbar
+        action_row = QHBoxLayout()
+        self.copy_btn = QPushButton("Copy All")
+        self.copy_btn.setFixedWidth(72)
+        self.copy_btn.clicked.connect(self._copy_output)
+        action_row.addWidget(self.copy_btn)
+
+        action_row.addWidget(QLabel("Find:"))
+        self.find_edit = QLineEdit()
+        self.find_edit.setPlaceholderText("search text…")
+        self.find_edit.returnPressed.connect(self._find_in_output)
+        action_row.addWidget(self.find_edit, 1)
+        self.find_btn = QPushButton("Find")
+        self.find_btn.setFixedWidth(48)
+        self.find_btn.clicked.connect(self._find_in_output)
+        action_row.addWidget(self.find_btn)
+
+        self.save_btn = QPushButton("Save to File…")
+        self.save_btn.clicked.connect(self._save_output)
+        action_row.addWidget(self.save_btn)
+
+        self.auto_refresh_check = QCheckBox("Auto-refresh (10 s)")
+        self.auto_refresh_check.stateChanged.connect(self._toggle_auto_refresh)
+        action_row.addWidget(self.auto_refresh_check)
+
+        output_layout.addLayout(action_row)
+        middle.addWidget(output_widget, 1)
+
+        root.addLayout(middle, 1)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def populate_files(self, blend_files: list):
+        """Populate the file combo from the main window's scanned file list."""
+        self._scanned_files = blend_files
+        self.file_combo.blockSignals(True)
+        self.file_combo.clear()
+        self.file_combo.addItems(blend_files)
+        self.file_combo.setCurrentIndex(-1)
+        self.file_combo.blockSignals(False)
+
+    # ------------------------------------------------------------------
+    # File selection
+    # ------------------------------------------------------------------
+
+    def _browse_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Blend File",
+            self.file_combo.currentText(),
+            "Blender Files (*.blend);;All Files (*)"
+        )
+        if path:
+            if self.file_combo.findText(path) == -1:
+                self.file_combo.addItem(path)
+            self.file_combo.setCurrentText(path)
+
+    def _on_file_changed(self, path: str):
+        self._populate_job_ids(path.strip())
+
+    def _reload_job_ids(self):
+        self._populate_job_ids(self.file_combo.currentText().strip())
+
+    def _populate_job_ids(self, blend_path: str):
+        import re
+        self.job_id_combo.blockSignals(True)
+        self.job_id_combo.clear()
+        self.no_ids_label.setVisible(False)
+
+        if not blend_path or not os.path.isfile(blend_path):
+            self.job_id_combo.blockSignals(False)
+            return
+
+        blend_dir = os.path.dirname(blend_path)
+        job_id_dir = os.path.join(blend_dir, "job_id")
+        job_name = os.path.basename(blend_path).replace(".blend", "")
+
+        job_ids = []
+        if os.path.isdir(job_id_dir):
+            for fname in os.listdir(job_id_dir):
+                if fname.startswith(job_name + "_jobID_") and fname.endswith(".txt"):
+                    m = re.match(rf"{re.escape(job_name)}_jobID_(.+)\.txt", fname)
+                    if m:
+                        job_ids.append(m.group(1))
+
+        if job_ids:
+            job_ids_sorted = sorted(job_ids, key=lambda x: (0, int(x)) if x.isdigit() else (1, x))
+            self.job_id_combo.addItems(job_ids_sorted)
+            self.job_id_combo.setCurrentIndex(0)
+        else:
+            self.no_ids_label.setVisible(True)
+
+        self.job_id_combo.blockSignals(False)
+
+    # ------------------------------------------------------------------
+    # Job loading
+    # ------------------------------------------------------------------
+
+    def _on_load_job_clicked(self):
+        raw = self.job_id_combo.currentText().strip()
+        if not raw or not raw.isdigit():
+            self._show_load_error("Please enter a numeric Job ID.")
+            return
+
+        job_id = int(raw)
+        self._current_job_id = job_id
+        self._job_data = None
+        self._hide_load_error()
+        self.output_edit.setPlainText("Loading job info…")
+        self.load_job_btn.setEnabled(False)
+
+        self._fetch_thread = JobFetchThread(job_id, "job_info")
+        self._fetch_thread.job_loaded.connect(self._on_job_loaded)
+        self._fetch_thread.error.connect(self._on_job_load_error)
+        self._fetch_thread.finished.connect(lambda: self.load_job_btn.setEnabled(True))
+        self._fetch_thread.start()
+
+    def _on_job_loaded(self, data: dict):
+        self._job_data = data
+        self._hide_load_error()
+        self._populate_scene_layer(data)
+        self._update_status_label(data)
+        self.output_edit.setPlainText("Job loaded. Select a block and task #, then click Show Output.")
+
+        # Stop auto-refresh if job is finished
+        state = str(data.get("state_str", data.get("state", ""))).upper()
+        if any(s in state for s in ("DONE", "ERROR", "SKIPPED")):
+            self._refresh_timer.stop()
+            self.auto_refresh_check.setChecked(False)
+
+    def _on_job_load_error(self, msg: str):
+        self._show_load_error(msg)
+        self.output_edit.setPlainText(
+            f"Error: {msg}\n\nCheck the Job ID and ensure the Afanasy server is reachable."
+        )
+
+    def _show_load_error(self, msg: str):
+        self.load_error_label.setText(f"⚠  {msg}")
+        self.load_error_label.setVisible(True)
+
+    def _hide_load_error(self):
+        self.load_error_label.setVisible(False)
+
+    # ------------------------------------------------------------------
+    # Scene / Layer combo population
+    # ------------------------------------------------------------------
+
+    def _populate_scene_layer(self, job_data: dict):
+        """Populate the scene/block combo directly from Afanasy block names.
+
+        _scene_layer_map: block_name → (block_num, task_count)
+        The block name (e.g. 'Main_AllLayers', 'Dome[Dome]') is shown as-is —
+        users select which block to view output for; no layer-level splitting.
+        """
+        self._scene_layer_map = {}
+
+        blocks_raw = job_data.get("blocks", [])
+        if not isinstance(blocks_raw, (list, tuple)):
+            blocks_raw = []
+
+        block_names = []
+        for block_num, block in enumerate(blocks_raw):
+            if isinstance(block, dict):
+                block_name = block.get("name", f"Block{block_num}")
+                task_count = block.get("tasks_num", block.get("tasksnumber", 1))
+            else:
+                block_name = getattr(block, "name", f"Block{block_num}")
+                task_count = getattr(block, "tasks_num",
+                                     getattr(block, "tasksnumber", 1))
+
+            self._scene_layer_map[block_name] = (
+                block_num, int(task_count) if task_count else 1
+            )
+            block_names.append(block_name)
+
+        self.scene_combo.blockSignals(True)
+        self.scene_combo.clear()
+        self.scene_combo.addItems(block_names)
+        self.scene_combo.setEnabled(bool(block_names))
+        if block_names:
+            self.scene_combo.setCurrentIndex(0)
+        self.scene_combo.blockSignals(False)
+
+        # Manually trigger max update for the first block (signals were blocked)
+        if block_names:
+            self._on_scene_changed(block_names[0])
+
+        self.show_output_btn.setEnabled(bool(block_names))
+
+    def _on_scene_changed(self, block_name: str):
+        """Update task spinbox maximum when the selected block changes."""
+        info = self._scene_layer_map.get(block_name)
+        if info:
+            _, task_count = info
+            self.task_spin.setMaximum(max(0, task_count - 1))
+
+    def _update_status_label(self, job_data: dict):
+        name = job_data.get("name", "—")
+        job_id = job_data.get("id", self._current_job_id or "—")
+        state = str(job_data.get("state_str", job_data.get("state", "—")))
+
+        # Try common task count fields
+        tasks_done = job_data.get("tasks_done_num", job_data.get("tasksdonenum", "—"))
+        tasks_total = job_data.get("tasks_num", job_data.get("tasksnum", "—"))
+
+        self.status_label.setText(
+            f"Job #{job_id} — {name}\n"
+            f"State: {state}\n"
+            f"Tasks: {tasks_done}/{tasks_total}"
+        )
+
+    # ------------------------------------------------------------------
+    # Output fetching & display
+    # ------------------------------------------------------------------
+
+    def _on_show_output_clicked(self):
+        block_name = self.scene_combo.currentText()
+        task_num = self.task_spin.value()
+
+        info = self._scene_layer_map.get(block_name)
+        if info is None:
+            self.output_edit.setPlainText("No block found for the selected scene.")
+            return
+
+        block_num, _ = info
+        self._fetch_task_output(block_num, task_num)
+
+    def _fetch_task_output(self, block_num: int, task_num: int):
+        if not self._current_job_id:
+            return
+        self.output_edit.setPlainText("Fetching task output…")
+        self.show_output_btn.setEnabled(False)
+
+        thread = JobFetchThread(self._current_job_id, "task_output",
+                                block_num=block_num, task_num=task_num)
+        thread.output_loaded.connect(self._on_output_loaded)
+        thread.error.connect(self._on_output_error)
+        thread.finished.connect(lambda: self.show_output_btn.setEnabled(True))
+        thread.start()
+        self._fetch_thread = thread
+
+    def _on_output_loaded(self, text: str):
+        if not text:
+            self.output_edit.setPlainText(
+                "No output yet — task may still be waiting or running."
+            )
+            return
+
+        # Optionally prepend crash.txt
+        crash_prefix = ""
+        if self.crash_check.isChecked():
+            crash_prefix = self._read_crash_txt()
+
+        full_text = crash_prefix + text
+
+        # Apply selected filter
+        if self.radio_errors.isChecked():
+            display = self._filter_errors_only(full_text)
+        elif self.radio_warnings.isChecked():
+            display = self._filter_warnings_only(full_text)
+        elif self.radio_saved.isChecked():
+            display = self._filter_saved_files(full_text)
+        elif self.radio_frames.isChecked():
+            display = self._filter_frame_summary(full_text)
+        else:
+            display = full_text
+
+        # Render as color-highlighted HTML
+        self.output_edit.setHtml(self._highlight_output(display))
+
+        # Scroll to bottom
+        sb = self.output_edit.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _on_output_error(self, msg: str):
+        self.output_edit.setPlainText(f"Error fetching output:\n{msg}")
+
+    # ------------------------------------------------------------------
+    # Output filtering & highlighting
+    # ------------------------------------------------------------------
+
+    def _filter_errors_only(self, text: str) -> str:
+        """Lines with Error/Traceback/Exception/CRITICAL + 2 context lines.
+        Warnings are intentionally excluded — use Warnings filter separately."""
+        import re
+        pattern = re.compile(
+            r"(error|traceback|exception|fatal|critical)", re.IGNORECASE
+        )
+        lines = text.splitlines()
+        result = []
+        i = 0
+        while i < len(lines):
+            if pattern.search(lines[i]):
+                result.append(lines[i])
+                for j in range(1, 3):
+                    if i + j < len(lines):
+                        result.append(lines[i + j])
+                i += 3
+            else:
+                i += 1
+        return "\n".join(result)
+
+    def _filter_warnings_only(self, text: str) -> str:
+        """Lines containing Warning/WARN (addon warnings are noisy in Blender)."""
+        import re
+        pattern = re.compile(r"(warning|warn\b)", re.IGNORECASE)
+        return "\n".join(l for l in text.splitlines() if pattern.search(l))
+
+    def _filter_saved_files(self, text: str) -> str:
+        """Saved: lines + standalone Time: lines grouped together.
+        Gives a per-frame summary: what was saved and how long it took."""
+        import re
+        time_pat = re.compile(r"^\s*Time:\s+\d+", re.IGNORECASE)
+        result = []
+        for line in text.splitlines():
+            if line.strip().startswith("Saved:") or time_pat.match(line):
+                result.append(line)
+        return "\n".join(result)
+
+    def _filter_frame_summary(self, text: str) -> str:
+        """All Fra: lines — shows tile/sample progress per frame.
+        Excludes Saved/Time lines so only render progress is shown."""
+        return "\n".join(
+            l for l in text.splitlines() if l.strip().startswith("Fra:")
+        )
+
+    def _read_crash_txt(self) -> str:
+        """Read crash.txt from the blend file directory if it exists."""
+        blend_path = self.file_combo.currentText().strip()
+        if not blend_path:
+            return ""
+        candidates = [
+            os.path.join(os.path.dirname(blend_path), "crash.txt"),
+            os.path.join(os.path.dirname(blend_path), "..", "crash.txt"),
+        ]
+        for p in candidates:
+            p = os.path.normpath(p)
+            if os.path.isfile(p):
+                try:
+                    with open(p, "r", errors="replace") as f:
+                        return f"=== crash.txt ===\n{f.read()}\n=================\n\n"
+                except Exception:
+                    pass
+        return ""
+
+    def _highlight_output(self, text: str) -> str:
+        """Convert plain text to HTML with color-coded lines."""
+        import html, re
+
+        COLOR_FRAME   = "#64b5f6"   # blue   — Fra:\d+
+        COLOR_ERROR   = "#ef5350"   # red    — Error / Traceback / CRITICAL
+        COLOR_WARN    = "#ffb300"   # amber  — Warning / WARN
+        COLOR_OK      = "#66bb6a"   # green  — Time / Mem / Finished / render
+        COLOR_CRASH   = "#ff6e40"   # orange — crash.txt header
+        COLOR_DEFAULT = "#b0b0b0"   # gray   — everything else
+
+        pat_frame   = re.compile(r"Fra:\d+", re.IGNORECASE)
+        pat_error   = re.compile(r"(error|traceback|critical)", re.IGNORECASE)
+        pat_warn    = re.compile(r"(warning|warn\b)", re.IGNORECASE)
+        pat_ok      = re.compile(r"(Time:|Mem:|Finished|render)", re.IGNORECASE)
+        pat_crash   = re.compile(r"=== crash\.txt ===", re.IGNORECASE)
+
+        parts = ['<pre style="margin:0;padding:0;font-family:monospace;font-size:9pt;">']
+        for line in text.splitlines():
+            escaped = html.escape(line)
+            if pat_crash.search(line):
+                color = COLOR_CRASH
+            elif pat_error.search(line):
+                color = COLOR_ERROR
+            elif pat_warn.search(line):
+                color = COLOR_WARN
+            elif pat_frame.search(line):
+                color = COLOR_FRAME
+            elif pat_ok.search(line):
+                color = COLOR_OK
+            else:
+                color = COLOR_DEFAULT
+            parts.append(f'<span style="color:{color}">{escaped}</span>')
+        parts.append("</pre>")
+        return "\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Find / Copy / Save
+    # ------------------------------------------------------------------
+
+    def _find_in_output(self):
+        needle = self.find_edit.text()
+        if not needle:
+            return
+        found = self.output_edit.find(needle)
+        if not found:
+            # Wrap around
+            cursor = self.output_edit.textCursor()
+            cursor.movePosition(cursor.MoveOperation.Start)
+            self.output_edit.setTextCursor(cursor)
+            self.output_edit.find(needle)
+
+    def _copy_output(self):
+        text = self.output_edit.toPlainText()
+        QApplication.clipboard().setText(text)
+
+    def _save_output(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Output", "", "Text Files (*.txt);;All Files (*)"
+        )
+        if path:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(self.output_edit.toPlainText())
+            except Exception as e:
+                QMessageBox.warning(self, "Save Error", str(e))
+
+    # ------------------------------------------------------------------
+    # Auto-refresh
+    # ------------------------------------------------------------------
+
+    def _toggle_auto_refresh(self, state: int):
+        if state == Qt.CheckState.Checked.value:
+            self._refresh_timer.start()
+        else:
+            self._refresh_timer.stop()
+
+    def _cleanup_finished_threads(self):
+        """Remove finished threads from _refresh_threads list."""
+        self._refresh_threads = [t for t in self._refresh_threads if t.isRunning()]
+
+    def _refresh(self):
+        """Re-fetch job info and task output."""
+        if not self._current_job_id:
+            return
+        
+        # Clean up any finished threads
+        self._cleanup_finished_threads()
+        
+        # Refresh job info silently
+        info_thread = JobFetchThread(self._current_job_id, "job_info")
+        info_thread.job_loaded.connect(self._on_job_loaded)
+        info_thread.finished.connect(self._cleanup_finished_threads)
+        info_thread.start()
+        self._refresh_threads.append(info_thread)  # Keep reference to prevent garbage collection
+
+        # Refresh current output if a block is selected
+        block_name = self.scene_combo.currentText()
+        info = self._scene_layer_map.get(block_name)
+        if info:
+            block_num, _ = info
+            task_num = self.task_spin.value()
+            out_thread = JobFetchThread(self._current_job_id, "task_output",
+                                        block_num=block_num, task_num=task_num)
+            out_thread.output_loaded.connect(self._on_output_loaded)
+            out_thread.error.connect(self._on_output_error)
+            out_thread.finished.connect(self._cleanup_finished_threads)
+            out_thread.start()
+            self._refresh_threads.append(out_thread)  # Keep reference to prevent garbage collection
+
+    def closeEvent(self, event):
+        self._refresh_timer.stop()
+        super().closeEvent(event)
+
+
+# ---------------------------------------------------------------------------
 # Submission Log
 # ---------------------------------------------------------------------------
 
@@ -1274,11 +1979,22 @@ class SubmissionPanel(QWidget):
         self.log.setFont(font)
         layout.addWidget(self.log)
 
-        # Bottom row: progress + submit
+        # Bottom row: progress + job log + submit
         bottom = QHBoxLayout()
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         bottom.addWidget(self.progress, 1)
+
+        self.job_log_btn = QPushButton("Job Log")
+        self.job_log_btn.setMinimumHeight(36)
+        self.job_log_btn.setToolTip("View Afanasy job terminal output")
+        self.job_log_btn.setStyleSheet(
+            "QPushButton { background-color: #37474f; color: #cfd8dc; "
+            "border-radius: 4px; padding: 8px 16px; }"
+            "QPushButton:hover { background-color: #546e7a; }"
+        )
+        bottom.addWidget(self.job_log_btn)
+
         self.submit_btn = QPushButton("Submit Selected")
         self.submit_btn.setMinimumHeight(36)
         self.submit_btn.setStyleSheet(
@@ -1325,6 +2041,7 @@ class MainWindow(QMainWindow):
         self.current_filepath = ""
         self.inspector_thread = None
         self.submit_thread = None
+        self._job_log_dialog = None  # Persistent reference to prevent garbage collection
 
         self._build_ui()
         self._load_settings()
@@ -1337,7 +2054,7 @@ class MainWindow(QMainWindow):
         main_layout.setSpacing(6)
 
         # Splitter: file panel (top) | settings tabs (middle) | submission log (bottom)
-        splitter = QSplitter(Qt.Orientation.Vertical)
+        self.splitter = QSplitter(Qt.Orientation.Vertical)
 
         # File panel
         self.file_panel = FilePanel()
@@ -1345,7 +2062,7 @@ class MainWindow(QMainWindow):
         self.file_panel.inspect_selected_btn.clicked.connect(self._inspect_selected)
         self.file_panel.inspect_all_btn.clicked.connect(self._inspect_all)
         self.file_panel.scan_btn.clicked.connect(self.update_cleanup_blend_list)
-        splitter.addWidget(self.file_panel)
+        self.splitter.addWidget(self.file_panel)
 
         # Settings tabs
         self.tabs = QTabWidget()
@@ -1355,19 +2072,22 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.job_tab, "Job Settings")
         self.tabs.addTab(self.render_tab, "Render Settings")
         self.tabs.addTab(self.app_tab, "App Settings")
-        splitter.addWidget(self.tabs)
+        self.splitter.addWidget(self.tabs)
 
         # Submission panel
         self.submission_panel = SubmissionPanel()
         self.submission_panel.submit_btn.clicked.connect(self._submit_selected)
-        splitter.addWidget(self.submission_panel)
+        self.submission_panel.job_log_btn.clicked.connect(self._open_job_log)
+        self.splitter.addWidget(self.submission_panel)
 
-        # Set splitter proportions
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setStretchFactor(2, 1)
+        # Stretch factors: extra space on resize distributed 3:2:1
+        self.splitter.setStretchFactor(0, 3)
+        self.splitter.setStretchFactor(1, 2)
+        self.splitter.setStretchFactor(2, 1)
+        # Explicit initial heights override the empty-table sizeHint (tiny on first run)
+        self.splitter.setSizes([400, 250, 150])
 
-        main_layout.addWidget(splitter)
+        main_layout.addWidget(self.splitter)
 
         # Keyboard shortcuts
         inspect_shortcut = QShortcut(QKeySequence("Ctrl+I"), self)
@@ -1387,6 +2107,9 @@ class MainWindow(QMainWindow):
         geom = settings.value("geometry")
         if geom:
             self.restoreGeometry(geom)
+        splitter_state = settings.value("splitter_state")
+        if splitter_state:
+            self.splitter.restoreState(splitter_state)
 
     def _save_settings(self):
         settings = QSettings("MonstaStudios", "BatchSubmitter")
@@ -1395,6 +2118,7 @@ class MainWindow(QMainWindow):
         settings.setValue("default_priority", self.job_tab.priority_spin.value())
         settings.setValue("default_fpt", self.render_tab.fpt_spin.value())
         settings.setValue("geometry", self.saveGeometry())
+        settings.setValue("splitter_state", self.splitter.saveState())
 
     def closeEvent(self, event):
         self._save_settings()
@@ -1402,6 +2126,21 @@ class MainWindow(QMainWindow):
             self.inspector_thread.stop()
             self.inspector_thread.wait(3000)
         super().closeEvent(event)
+
+    # --- Job Log Viewer ---
+
+    def _open_job_log(self):
+        # Close existing dialog if one is open
+        if self._job_log_dialog is not None:
+            self._job_log_dialog.close()
+        
+        # Create new dialog with persistent reference
+        self._job_log_dialog = JobLogDialog(self)
+        # Set Qt.WA_DeleteOnClose to clean up resources when dialog closes
+        self._job_log_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        # Populate files and show (non-blocking — user can keep using main window)
+        self._job_log_dialog.populate_files(self.file_panel.get_all_filepaths())
+        self._job_log_dialog.show()
 
     # --- File selection ---
 
@@ -1515,17 +2254,13 @@ class MainWindow(QMainWindow):
         scenes = metadata.get("scenes", [])
         first_scene = scenes[0] if scenes else {}
 
-        # Extract layer names from view_layers (which may be dicts or strings)
+        # Extract enabled layer names from view_layers
         view_layers_data = first_scene.get("view_layers", [])
         enabled_layer_names = []
         for layer_data in view_layers_data:
-            if isinstance(layer_data, dict):
-                # Only include layers that are enabled for rendering
-                if layer_data.get("use", True):
-                    enabled_layer_names.append(layer_data.get("name", ""))
-            else:
-                # Old string format
-                enabled_layer_names.append(layer_data)
+            # Only include layers that are enabled for rendering
+            if layer_data.get("use", True):
+                enabled_layer_names.append(layer_data.get("name", ""))
 
         fd = BlendFileData(
             filepath=filepath,

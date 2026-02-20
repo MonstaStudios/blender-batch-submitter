@@ -13,6 +13,7 @@ import sys
 metadata = {
     "file": bpy.data.filepath,
     "job_name": bpy.path.basename(bpy.data.filepath).replace(".blend", ""),
+    "blender_version": f"{bpy.app.version[0]}.{bpy.app.version[1]}",
     "scenes": [],
 }
 
@@ -27,7 +28,7 @@ for scene in bpy.data.scenes:
         "resolution_y": scene.render.resolution_y,
         "output_path": scene.render.filepath,
         "output_format": scene.render.image_settings.file_format,
-        "view_layers": [vl.name for vl in scene.view_layers if vl.use],
+        "view_layers": [{"name": vl.name, "use": vl.use} for vl in scene.view_layers],
         "use_nodes": scene.use_nodes,
     }
     metadata["scenes"].append(scene_data)
