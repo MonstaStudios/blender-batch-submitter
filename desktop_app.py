@@ -1,24 +1,10 @@
-import re
-import os
-
-def remove_job_id_txt(filepath: str, job_id: str):
-    """Remove the job_id txt file for a given blend file and job_id."""
-    blend_dir = os.path.dirname(filepath)
-    job_id_dir = os.path.join(blend_dir, "job_id")
-    job_name = os.path.basename(filepath).replace(".blend", "")
-    txt_filename = f"{job_name}_jobID_{job_id}.txt"
-    txt_path = os.path.join(job_id_dir, txt_filename)
-    if os.path.exists(txt_path):
-        try:
-            os.remove(txt_path)
-        except Exception:
-            pass
-
 """
 Batch Submitter - Blender to CGRU Afanasy Farm
 A standalone PyQt6 desktop application for submitting Blender render jobs
 to the Afanasy render farm.
 """
+
+import re
 import os
 import sys
 import json
@@ -76,6 +62,41 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSettings, QTimer
 from PyQt6.QtGui import QFont, QColor, QPalette, QShortcut, QKeySequence
 
 import af
+
+def remove_job_id_txt(filepath: str, job_id: str):
+    """Remove the job_id txt file for a given blend file and job_id."""
+    blend_dir = os.path.dirname(filepath)
+    job_id_dir = os.path.join(blend_dir, "job_id")
+    job_name = os.path.basename(filepath).replace(".blend", "")
+    txt_filename = f"{job_name}_jobID_{job_id}.txt"
+    txt_path = os.path.join(job_id_dir, txt_filename)
+    if os.path.exists(txt_path):
+        try:
+            os.remove(txt_path)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+
+def quote_arg(arg: str) -> str:
+    """Quote a shell argument in an OS-aware manner.
+    
+    On POSIX systems (Linux, macOS): uses shlex.quote() with single quotes.
+    On Windows (nt): uses double quotes with proper escaping.
+    
+    This ensures commands work correctly on both Unix render nodes and Windows render nodes.
+    """
+    if os.name == 'nt':
+        # Windows command line: escape internal double quotes by doubling them
+        # Wrap in double quotes
+        escaped = arg.replace('"', '""')
+        return f'"{escaped}"'
+    else:
+        # POSIX systems: use shlex.quote() for proper shell escaping
+        return shlex.quote(arg)
 
 
 # ---------------------------------------------------------------------------
@@ -290,17 +311,17 @@ def _create_block_for_layer(
     Relies on blend file's view layer states (vl.use flags).
     Blender automatically renders all enabled layers.
     """
-    cmd = f'{shlex.quote(blender)} -b {shlex.quote(blend_file)} -y'
+    cmd = f'{quote_arg(blender)} -b {quote_arg(blend_file)} -y'
     if scene_name:
-        cmd += f' -S {shlex.quote(scene_name)}'
+        cmd += f' -S {quote_arg(scene_name)}'
 
     # Python expression removed - rely on blend file layer states
     # Blender renders all layers with vl.use=True automatically
 
     if output_path:
-        cmd += f' -o {shlex.quote(output_path)}'
+        cmd += f' -o {quote_arg(output_path)}'
     if output_format:
-        cmd += f' -F {shlex.quote(output_format)}'
+        cmd += f' -F {quote_arg(output_format)}'
 
     # Use animation rendering for proper frame iteration with Afanasy
     cmd += f' -s @#@ -e @#@ -j {frame_step} -a'
@@ -334,18 +355,18 @@ def _create_single_block_for_layers(
     Relies on blend file's view layer states (vl.use flags).
     Blender automatically renders all enabled layers and outputs each to its own path.
     """
-    cmd = f'{shlex.quote(blender)} -b {shlex.quote(blend_file)} -y'
+    cmd = f'{quote_arg(blender)} -b {quote_arg(blend_file)} -y'
     if scene_name:
-        cmd += f' -S {shlex.quote(scene_name)}'
+        cmd += f' -S {quote_arg(scene_name)}'
 
     # Python expression removed - rely on blend file layer states
     # Blender renders all layers with vl.use=True automatically
     # User controls layer states by editing the blend file before submission
 
     if output_path:
-        cmd += f' -o {shlex.quote(output_path)}'
+        cmd += f' -o {quote_arg(output_path)}'
     if output_format:
-        cmd += f' -F {shlex.quote(output_format)}'
+        cmd += f' -F {quote_arg(output_format)}'
 
     # Use animation rendering for proper frame iteration with Afanasy
     cmd += f' -s @#@ -e @#@ -j {frame_step} -a'
@@ -1254,7 +1275,7 @@ class AppSettingsTab(QWidget):
                     job_ids.append(m.group(1))
         if job_ids:
             self.cleanup_jobid_combo.clear()
-            self.cleanup_jobid_combo.addItems(sorted(job_ids, key=lambda x: int(x) if x.isdigit() else x))
+            self.cleanup_jobid_combo.addItems(sorted(job_ids, key=lambda x: (0, int(x)) if x.isdigit() else (1, x)))
             self.cleanup_jobid_combo.setCurrentIndex(0)
         else:
             self.cleanup_jobid_combo.clear()
@@ -1324,6 +1345,7 @@ class JobLogDialog(QDialog):
         self._scanned_files = []       # blend file paths from main window
         self._current_job_id = None    # currently loaded job ID (int)
         self._fetch_thread = None      # active JobFetchThread
+        self._refresh_threads = []     # list of threads for auto-refresh (prevent garbage collection)
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(10000)  # 10 s
         self._refresh_timer.timeout.connect(self._refresh)
@@ -1560,7 +1582,7 @@ class JobLogDialog(QDialog):
                         job_ids.append(m.group(1))
 
         if job_ids:
-            job_ids_sorted = sorted(job_ids, key=lambda x: int(x) if x.isdigit() else x)
+            job_ids_sorted = sorted(job_ids, key=lambda x: (0, int(x)) if x.isdigit() else (1, x))
             self.job_id_combo.addItems(job_ids_sorted)
             self.job_id_combo.setCurrentIndex(0)
         else:
@@ -1896,14 +1918,24 @@ class JobLogDialog(QDialog):
         else:
             self._refresh_timer.stop()
 
+    def _cleanup_finished_threads(self):
+        """Remove finished threads from _refresh_threads list."""
+        self._refresh_threads = [t for t in self._refresh_threads if t.isRunning()]
+
     def _refresh(self):
         """Re-fetch job info and task output."""
         if not self._current_job_id:
             return
+        
+        # Clean up any finished threads
+        self._cleanup_finished_threads()
+        
         # Refresh job info silently
         info_thread = JobFetchThread(self._current_job_id, "job_info")
         info_thread.job_loaded.connect(self._on_job_loaded)
+        info_thread.finished.connect(self._cleanup_finished_threads)
         info_thread.start()
+        self._refresh_threads.append(info_thread)  # Keep reference to prevent garbage collection
 
         # Refresh current output if a block is selected
         block_name = self.scene_combo.currentText()
@@ -1915,7 +1947,9 @@ class JobLogDialog(QDialog):
                                         block_num=block_num, task_num=task_num)
             out_thread.output_loaded.connect(self._on_output_loaded)
             out_thread.error.connect(self._on_output_error)
+            out_thread.finished.connect(self._cleanup_finished_threads)
             out_thread.start()
+            self._refresh_threads.append(out_thread)  # Keep reference to prevent garbage collection
 
     def closeEvent(self, event):
         self._refresh_timer.stop()
@@ -2006,6 +2040,7 @@ class MainWindow(QMainWindow):
         self.current_filepath = ""
         self.inspector_thread = None
         self.submit_thread = None
+        self._job_log_dialog = None  # Persistent reference to prevent garbage collection
 
         self._build_ui()
         self._load_settings()
@@ -2088,9 +2123,17 @@ class MainWindow(QMainWindow):
     # --- Job Log Viewer ---
 
     def _open_job_log(self):
-        dlg = JobLogDialog(self)
-        dlg.populate_files(self.file_panel.get_all_filepaths())
-        dlg.show()  # Non-blocking — user can keep using main window
+        # Close existing dialog if one is open
+        if self._job_log_dialog is not None:
+            self._job_log_dialog.close()
+        
+        # Create new dialog with persistent reference
+        self._job_log_dialog = JobLogDialog(self)
+        # Set Qt.WA_DeleteOnClose to clean up resources when dialog closes
+        self._job_log_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        # Populate files and show (non-blocking — user can keep using main window)
+        self._job_log_dialog.populate_files(self.file_panel.get_all_filepaths())
+        self._job_log_dialog.show()
 
     # --- File selection ---
 
