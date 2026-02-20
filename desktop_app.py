@@ -1116,7 +1116,8 @@ class RenderSettingsTab(QWidget):
             idx = self.format_combo.findText(fmt)
             if idx >= 0:
                 self.format_combo.setCurrentIndex(idx)
-            self._populate_layers(scene_data.get("view_layers", []))
+            # Pass current selection (list of layer name strings) so _populate_layers can check matching layers
+            self._populate_layers(self._current_file_data.selected_layers)
             self._update_calculated()
 
     def _on_parallel_mode_changed(self, _state):
@@ -2053,7 +2054,7 @@ class MainWindow(QMainWindow):
         main_layout.setSpacing(6)
 
         # Splitter: file panel (top) | settings tabs (middle) | submission log (bottom)
-        splitter = QSplitter(Qt.Orientation.Vertical)
+        self.splitter = QSplitter(Qt.Orientation.Vertical)
 
         # File panel
         self.file_panel = FilePanel()
@@ -2061,7 +2062,7 @@ class MainWindow(QMainWindow):
         self.file_panel.inspect_selected_btn.clicked.connect(self._inspect_selected)
         self.file_panel.inspect_all_btn.clicked.connect(self._inspect_all)
         self.file_panel.scan_btn.clicked.connect(self.update_cleanup_blend_list)
-        splitter.addWidget(self.file_panel)
+        self.splitter.addWidget(self.file_panel)
 
         # Settings tabs
         self.tabs = QTabWidget()
@@ -2071,20 +2072,22 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.job_tab, "Job Settings")
         self.tabs.addTab(self.render_tab, "Render Settings")
         self.tabs.addTab(self.app_tab, "App Settings")
-        splitter.addWidget(self.tabs)
+        self.splitter.addWidget(self.tabs)
 
         # Submission panel
         self.submission_panel = SubmissionPanel()
         self.submission_panel.submit_btn.clicked.connect(self._submit_selected)
         self.submission_panel.job_log_btn.clicked.connect(self._open_job_log)
-        splitter.addWidget(self.submission_panel)
+        self.splitter.addWidget(self.submission_panel)
 
-        # Set splitter proportions
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setStretchFactor(2, 1)
+        # Stretch factors: extra space on resize distributed 3:2:1
+        self.splitter.setStretchFactor(0, 3)
+        self.splitter.setStretchFactor(1, 2)
+        self.splitter.setStretchFactor(2, 1)
+        # Explicit initial heights override the empty-table sizeHint (tiny on first run)
+        self.splitter.setSizes([400, 250, 150])
 
-        main_layout.addWidget(splitter)
+        main_layout.addWidget(self.splitter)
 
         # Keyboard shortcuts
         inspect_shortcut = QShortcut(QKeySequence("Ctrl+I"), self)
@@ -2104,6 +2107,9 @@ class MainWindow(QMainWindow):
         geom = settings.value("geometry")
         if geom:
             self.restoreGeometry(geom)
+        splitter_state = settings.value("splitter_state")
+        if splitter_state:
+            self.splitter.restoreState(splitter_state)
 
     def _save_settings(self):
         settings = QSettings("MonstaStudios", "BatchSubmitter")
@@ -2112,6 +2118,7 @@ class MainWindow(QMainWindow):
         settings.setValue("default_priority", self.job_tab.priority_spin.value())
         settings.setValue("default_fpt", self.render_tab.fpt_spin.value())
         settings.setValue("geometry", self.saveGeometry())
+        settings.setValue("splitter_state", self.splitter.saveState())
 
     def closeEvent(self, event):
         self._save_settings()
