@@ -77,6 +77,28 @@ def remove_job_id_txt(filepath: str, job_id: str):
             pass
 
 
+def scan_job_ids_for_directory(directory: str) -> list:
+    """Scan a directory's job_id/ subfolder for all job ID text files.
+
+    Returns a list of (job_name, job_id_str) tuples sorted numerically.
+    Returns an empty list if no job_id folder exists.
+
+    File naming convention: {job_name}_jobID_{id}.txt
+    """
+    import re as _re
+    job_id_dir = os.path.join(directory, "job_id")
+    if not os.path.isdir(job_id_dir):
+        return []
+    results = []
+    pattern = _re.compile(r"^(.+)_jobID_(.+)\.txt$")
+    for fname in os.listdir(job_id_dir):
+        m = pattern.match(fname)
+        if m:
+            results.append((m.group(1), m.group(2)))
+    results.sort(key=lambda t: (0, int(t[1])) if t[1].isdigit() else (1, t[1]))
+    return results
+
+
 # ---------------------------------------------------------------------------
 # Utility functions
 # ---------------------------------------------------------------------------
@@ -286,6 +308,34 @@ class JobFetchThread(QThread):
                     self.error.emit(result["error"])
                 else:
                     self.error.emit("Could not fetch task output.")
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+# ---------------------------------------------------------------------------
+# Job Stats Fetch Thread
+# ---------------------------------------------------------------------------
+
+class JobStatsFetchThread(QThread):
+    """Fetches get_job_stats() data for a single job in the background."""
+    stats_loaded = pyqtSignal(dict)   # full stats dict from get_job_stats()
+    error        = pyqtSignal(str)    # error message string
+
+    def __init__(self, job_id: int):
+        super().__init__()
+        self.job_id = job_id
+
+    def run(self):
+        try:
+            from afanasy_service_complete import AfanasyService
+            result = AfanasyService.get_job_stats(self.job_id)
+            if result:
+                self.stats_loaded.emit(result)
+            else:
+                self.error.emit(
+                    f"Job ID {self.job_id} not found on farm.\n"
+                    "The job may have been deleted."
+                )
         except Exception as e:
             self.error.emit(str(e))
 
@@ -1958,6 +2008,370 @@ class JobLogDialog(QDialog):
 
 
 # ---------------------------------------------------------------------------
+# Farm Overview / Job Stats Panel
+# ---------------------------------------------------------------------------
+
+class JobStatsPanel(QDialog):
+    """Dialog for viewing per-job render statistics for a directory or blend file.
+
+    User flow:
+        1. Enter/browse a directory OR a single .blend file path
+        2. Click "Scan" to auto-detect all job IDs from job_id/ subfolder
+        3. Select a job from the left-hand QListWidget
+        4. Stats are fetched from Afanasy and displayed:
+           - Progress bar + ETA in summary section
+           - Per-block timings in a table
+        5. Optionally enable auto-refresh (10 s interval)
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Farm Overview — Job Stats")
+        self.resize(960, 580)
+        self.setMinimumSize(700, 450)
+        self._stats_cache: dict = {}
+        self._fetch_threads: list = []
+        self._refresh_threads: list = []
+        self._current_job_id = None
+        self._job_entries: list = []
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(10_000)
+        self._refresh_timer.timeout.connect(self._refresh)
+        self._build_ui()
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+
+        # --- top row: path input + browse + scan ---
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel("Path:"))
+        self.path_edit = QLineEdit()
+        self.path_edit.setPlaceholderText("Select .blend file or directory…")
+        top_row.addWidget(self.path_edit, 1)
+        self.browse_blend_btn = QPushButton("Blend…")
+        self.browse_blend_btn.setFixedWidth(72)
+        self.browse_blend_btn.clicked.connect(self._browse_blend)
+        top_row.addWidget(self.browse_blend_btn)
+        self.browse_dir_btn = QPushButton("Dir…")
+        self.browse_dir_btn.setFixedWidth(56)
+        self.browse_dir_btn.clicked.connect(self._browse_dir)
+        top_row.addWidget(self.browse_dir_btn)
+        self.scan_btn = QPushButton("Scan")
+        self.scan_btn.setFixedWidth(64)
+        self.scan_btn.setStyleSheet(
+            "QPushButton { background-color: #1565c0; color: white; font-weight: bold; "
+            "border-radius: 4px; padding: 4px 10px; }"
+            "QPushButton:hover { background-color: #1976d2; }"
+        )
+        self.scan_btn.clicked.connect(self._scan)
+        top_row.addWidget(self.scan_btn)
+        root.addLayout(top_row)
+
+        # --- warning / error labels ---
+        self.no_jobs_label = QLabel("No job IDs found. Submit jobs first or enter a path that contains a job_id/ folder.")
+        self.no_jobs_label.setStyleSheet("color: #ffb300; font-style: italic;")
+        self.no_jobs_label.setVisible(False)
+        root.addWidget(self.no_jobs_label)
+
+        self.error_label = QLabel("")
+        self.error_label.setStyleSheet("color: #ef5350;")
+        self.error_label.setVisible(False)
+        root.addWidget(self.error_label)
+
+        # --- main splitter ---
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        root.addWidget(splitter, 1)
+
+        # Left pane: job list
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 4, 0)
+        left_layout.addWidget(QLabel("Jobs Found:"))
+        self.job_list = QListWidget()
+        self.job_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.job_list.setMinimumWidth(200)
+        self.job_list.currentItemChanged.connect(self._on_job_selected)
+        left_layout.addWidget(self.job_list, 1)
+        splitter.addWidget(left_widget)
+
+        # Right pane: stats detail
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(4, 0, 0, 0)
+
+        # Summary group
+        summary_group = QGroupBox("Job Summary")
+        summary_form = QFormLayout(summary_group)
+        summary_form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+
+        self.job_name_label = QLabel("—")
+        self.job_name_label.setStyleSheet("font-weight: bold;")
+        summary_form.addRow("Name:", self.job_name_label)
+
+        self.state_label = QLabel("—")
+        summary_form.addRow("State:", self.state_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("0.0%")
+        self.progress_bar.setMinimumHeight(22)
+        summary_form.addRow("Progress:", self.progress_bar)
+
+        self.task_counts_label = QLabel("—")
+        summary_form.addRow("Tasks:", self.task_counts_label)
+
+        self.eta_label = QLabel("—")
+        summary_form.addRow("ETA:", self.eta_label)
+
+        right_layout.addWidget(summary_group)
+
+        # Block details group
+        blocks_group = QGroupBox("Block Details")
+        blocks_layout = QVBoxLayout(blocks_group)
+        self.blocks_table = QTableWidget(0, 7)
+        self.blocks_table.setHorizontalHeaderLabels(
+            ["Block", "Tasks", "Done", "Running", "Error", "Avg Render", "ETA"]
+        )
+        self.blocks_table.setAlternatingRowColors(True)
+        self.blocks_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.blocks_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        hh = self.blocks_table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for col in range(1, 7):
+            hh.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        blocks_layout.addWidget(self.blocks_table)
+        right_layout.addWidget(blocks_group, 1)
+
+        splitter.addWidget(right_widget)
+        splitter.setSizes([240, 720])
+
+        # --- bottom row: status + refresh ---
+        bottom_row = QHBoxLayout()
+        self.status_label = QLabel("—")
+        self.status_label.setStyleSheet("color: #9e9e9e; font-style: italic;")
+        bottom_row.addWidget(self.status_label)
+        bottom_row.addStretch()
+        self.auto_refresh_check = QCheckBox("Auto-refresh (10 s)")
+        self.auto_refresh_check.stateChanged.connect(self._toggle_auto_refresh)
+        bottom_row.addWidget(self.auto_refresh_check)
+        root.addLayout(bottom_row)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def populate_files(self, blend_files: list):
+        """Pre-fill path from the first file's directory (called by MainWindow)."""
+        if blend_files:
+            self.path_edit.setText(os.path.dirname(blend_files[0]))
+
+    # ------------------------------------------------------------------
+    # Browse / scan
+    # ------------------------------------------------------------------
+
+    def _browse_blend(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Blend File",
+            self.path_edit.text(),
+            "Blender Files (*.blend);;All Files (*)"
+        )
+        if path:
+            self.path_edit.setText(path)
+
+    def _browse_dir(self):
+        path = QFileDialog.getExistingDirectory(
+            self, "Select Directory", self.path_edit.text()
+        )
+        if path:
+            self.path_edit.setText(path)
+
+    def _scan(self):
+        raw = self.path_edit.text().strip()
+        if not raw:
+            return
+        if os.path.isfile(raw) and raw.endswith(".blend"):
+            directory = os.path.dirname(raw)
+        elif os.path.isdir(raw):
+            directory = raw
+        else:
+            self.no_jobs_label.setText("Path does not exist or is not a .blend file / directory.")
+            self.no_jobs_label.setVisible(True)
+            return
+        entries = scan_job_ids_for_directory(directory)
+        self._populate_job_list(entries)
+
+    def _populate_job_list(self, entries: list):
+        self._job_entries = entries
+        self.job_list.clear()
+        if not entries:
+            self.no_jobs_label.setText(
+                "No job IDs found. Submit jobs first or check that a job_id/ subfolder exists."
+            )
+            self.no_jobs_label.setVisible(True)
+            return
+        self.no_jobs_label.setVisible(False)
+        for job_name, job_id_str in entries:
+            item = QListWidgetItem(f"{job_name}  [{job_id_str}]")
+            item.setData(Qt.ItemDataRole.UserRole, int(job_id_str) if job_id_str.isdigit() else None)
+            self.job_list.addItem(item)
+        self.job_list.setCurrentRow(0)
+
+    # ------------------------------------------------------------------
+    # Job selection & fetching
+    # ------------------------------------------------------------------
+
+    def _on_job_selected(self, current: QListWidgetItem, previous: QListWidgetItem):
+        if current is None:
+            return
+        job_id = current.data(Qt.ItemDataRole.UserRole)
+        if job_id is None:
+            self.status_label.setText("Invalid job ID")
+            return
+        self._current_job_id = job_id
+        if job_id in self._stats_cache:
+            self._render_stats(self._stats_cache[job_id])
+        else:
+            self._fetch_stats(job_id)
+
+    def _fetch_stats(self, job_id: int):
+        self.status_label.setText("Loading…")
+        self.error_label.setVisible(False)
+        thread = JobStatsFetchThread(job_id)
+        thread.stats_loaded.connect(self._on_stats_loaded)
+        thread.error.connect(self._on_stats_error)
+        thread.finished.connect(self._cleanup_threads)
+        thread.start()
+        self._fetch_threads.append(thread)
+
+    def _on_stats_loaded(self, data: dict):
+        import datetime
+        job_id = data.get("job_id")
+        self._stats_cache[job_id] = data
+        self._update_list_item_state(job_id, str(data.get("state", "")))
+        if job_id == self._current_job_id:
+            self._render_stats(data)
+        self.status_label.setText(
+            f"Updated: {datetime.datetime.now().strftime('%H:%M:%S')}"
+        )
+
+    def _on_stats_error(self, msg: str):
+        self.error_label.setText(msg)
+        self.error_label.setVisible(True)
+        self.status_label.setText("Error fetching stats")
+
+    # ------------------------------------------------------------------
+    # Stats rendering
+    # ------------------------------------------------------------------
+
+    def _render_stats(self, data: dict):
+        self.error_label.setVisible(False)
+
+        # Summary
+        self.job_name_label.setText(
+            f"{data.get('job_name', '—')}  (ID: {data.get('job_id', '—')})"
+        )
+        state = str(data.get("state", "—"))
+        self.state_label.setText(state)
+        self.state_label.setStyleSheet(
+            f"color: {self._state_color(state)}; font-weight: bold;"
+        )
+        pct = float(data.get("progress_percentage", 0))
+        self.progress_bar.setValue(int(pct))
+        self.progress_bar.setFormat(f"{pct:.1f}%")
+
+        s = data.get("summary", {})
+        self.task_counts_label.setText(
+            f"Done: {s.get('tasks_done', 0)} / "
+            f"Running: {s.get('tasks_running', 0)} / "
+            f"Ready: {s.get('tasks_ready', 0)} / "
+            f"Error: {s.get('tasks_error', 0)} / "
+            f"Total: {s.get('total_tasks', 0)}"
+        )
+        self.eta_label.setText(f"{s.get('overall_eta_formatted', '—')}")
+
+        # Blocks table
+        blocks = data.get("blocks", [])
+        self.blocks_table.setRowCount(0)
+        for block in blocks:
+            row = self.blocks_table.rowCount()
+            self.blocks_table.insertRow(row)
+            rt = block.get("render_timings", {})
+            cells = [
+                block.get("name", "—"),
+                str(block.get("tasks_num", "—")),
+                str(block.get("p_tasks_done", "—")),
+                str(block.get("p_tasks_running", "—")),
+                str(block.get("p_tasks_error", "—")),
+                rt.get("avg_formatted", "—"),
+                block.get("eta_formatted", "—"),
+            ]
+            for col, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.blocks_table.setItem(row, col, item)
+
+    def _state_color(self, state: str) -> str:
+        s = state.upper()
+        if "DONE" in s:
+            return "#66bb6a"
+        if "ERROR" in s:
+            return "#ef5350"
+        if "RUN" in s:
+            return "#64b5f6"
+        if "WAIT" in s or "READY" in s:
+            return "#ffb300"
+        return "#b0b0b0"
+
+    def _update_list_item_state(self, job_id: int, state: str):
+        color = self._state_color(state)
+        for i in range(self.job_list.count()):
+            item = self.job_list.item(i)
+            if item and item.data(Qt.ItemDataRole.UserRole) == job_id:
+                item.setForeground(QColor(color))
+                break
+
+    # ------------------------------------------------------------------
+    # Auto-refresh
+    # ------------------------------------------------------------------
+
+    def _toggle_auto_refresh(self, state: int):
+        if state == Qt.CheckState.Checked.value:
+            self._refresh_timer.start()
+        else:
+            self._refresh_timer.stop()
+
+    def _refresh(self):
+        for job_name, job_id_str in self._job_entries:
+            if not job_id_str.isdigit():
+                continue
+            job_id = int(job_id_str)
+            thread = JobStatsFetchThread(job_id)
+            thread.stats_loaded.connect(self._on_stats_loaded)
+            thread.finished.connect(self._cleanup_threads)
+            thread.start()
+            self._refresh_threads.append(thread)
+
+    def _cleanup_threads(self):
+        self._fetch_threads = [t for t in self._fetch_threads if t.isRunning()]
+        self._refresh_threads = [t for t in self._refresh_threads if t.isRunning()]
+
+    # ------------------------------------------------------------------
+    # Close
+    # ------------------------------------------------------------------
+
+    def closeEvent(self, event):
+        self._refresh_timer.stop()
+        super().closeEvent(event)
+
+
+# ---------------------------------------------------------------------------
 # Submission Log
 # ---------------------------------------------------------------------------
 
@@ -1994,6 +2408,16 @@ class SubmissionPanel(QWidget):
             "QPushButton:hover { background-color: #546e7a; }"
         )
         bottom.addWidget(self.job_log_btn)
+
+        self.farm_overview_btn = QPushButton("Farm Overview")
+        self.farm_overview_btn.setMinimumHeight(36)
+        self.farm_overview_btn.setToolTip("View render farm job statistics")
+        self.farm_overview_btn.setStyleSheet(
+            "QPushButton { background-color: #37474f; color: #cfd8dc; "
+            "border-radius: 4px; padding: 8px 16px; }"
+            "QPushButton:hover { background-color: #546e7a; }"
+        )
+        bottom.addWidget(self.farm_overview_btn)
 
         self.submit_btn = QPushButton("Submit Selected")
         self.submit_btn.setMinimumHeight(36)
@@ -2042,6 +2466,7 @@ class MainWindow(QMainWindow):
         self.inspector_thread = None
         self.submit_thread = None
         self._job_log_dialog = None  # Persistent reference to prevent garbage collection
+        self._job_stats_panel = None  # Persistent reference for JobStatsPanel
 
         self._build_ui()
         self._load_settings()
@@ -2078,6 +2503,7 @@ class MainWindow(QMainWindow):
         self.submission_panel = SubmissionPanel()
         self.submission_panel.submit_btn.clicked.connect(self._submit_selected)
         self.submission_panel.job_log_btn.clicked.connect(self._open_job_log)
+        self.submission_panel.farm_overview_btn.clicked.connect(self._open_job_stats)
         self.splitter.addWidget(self.submission_panel)
 
         # Stretch factors: extra space on resize distributed 3:2:1
@@ -2128,6 +2554,14 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     # --- Job Log Viewer ---
+
+    def _open_job_stats(self):
+        if self._job_stats_panel is not None:
+            self._job_stats_panel.close()
+        self._job_stats_panel = JobStatsPanel(self)
+        self._job_stats_panel.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self._job_stats_panel.populate_files(self.file_panel.get_all_filepaths())
+        self._job_stats_panel.show()
 
     def _open_job_log(self):
         # Close existing dialog if one is open
