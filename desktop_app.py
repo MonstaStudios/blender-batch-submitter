@@ -2221,7 +2221,7 @@ class JobStatsPanel(QDialog):
             item = QListWidgetItem(f"{job_name}  [{job_id_str}]")
             item.setData(Qt.ItemDataRole.UserRole, int(job_id_str) if job_id_str.isdigit() else None)
             self.job_list.addItem(item)
-        self.job_list.setCurrentRow(0)
+        self.job_list.setCurrentRow(-1)  # no auto-select; user picks explicitly
 
     # ------------------------------------------------------------------
     # Job selection & fetching
@@ -2557,22 +2557,29 @@ class MainWindow(QMainWindow):
 
     def _open_job_stats(self):
         if self._job_stats_panel is not None:
-            self._job_stats_panel.close()
+            try:
+                self._job_stats_panel.close()
+            except RuntimeError:
+                pass
         self._job_stats_panel = JobStatsPanel(self)
         self._job_stats_panel.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self._job_stats_panel.destroyed.connect(
+            lambda: setattr(self, '_job_stats_panel', None)
+        )
         self._job_stats_panel.populate_files(self.file_panel.get_all_filepaths())
         self._job_stats_panel.show()
 
     def _open_job_log(self):
-        # Close existing dialog if one is open
         if self._job_log_dialog is not None:
-            self._job_log_dialog.close()
-        
-        # Create new dialog with persistent reference
+            try:
+                self._job_log_dialog.close()
+            except RuntimeError:
+                pass
         self._job_log_dialog = JobLogDialog(self)
-        # Set Qt.WA_DeleteOnClose to clean up resources when dialog closes
         self._job_log_dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
-        # Populate files and show (non-blocking — user can keep using main window)
+        self._job_log_dialog.destroyed.connect(
+            lambda: setattr(self, '_job_log_dialog', None)
+        )
         self._job_log_dialog.populate_files(self.file_panel.get_all_filepaths())
         self._job_log_dialog.show()
 
